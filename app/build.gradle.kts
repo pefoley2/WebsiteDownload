@@ -38,6 +38,9 @@ android {
     buildFeatures {
         compose = true
     }
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
     buildToolsVersion = "37.0.0"
     ndkVersion = "30.0.16138531 rc3"
 }

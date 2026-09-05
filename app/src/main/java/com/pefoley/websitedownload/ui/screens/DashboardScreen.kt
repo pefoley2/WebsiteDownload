@@ -9,19 +9,25 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material3.*
 import androidx.compose.material3.adaptive.ExperimentalMaterial3AdaptiveApi
 import androidx.compose.material3.adaptive.layout.AnimatedPane
 import androidx.compose.material3.adaptive.layout.ListDetailPaneScaffold
 import androidx.compose.material3.adaptive.layout.ListDetailPaneScaffoldRole
+import androidx.compose.material3.adaptive.navigation.BackNavigationBehavior
 import androidx.compose.material3.adaptive.navigation.rememberListDetailPaneScaffoldNavigator
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import kotlinx.coroutines.launch
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
@@ -40,11 +46,21 @@ fun DashboardScreen(
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val navigator = rememberListDetailPaneScaffoldNavigator<String>()
     val scope = rememberCoroutineScope()
+    var isAddingSite by rememberSaveable { mutableStateOf(value = false) }
 
-    BackHandler(enabled = navigator.canNavigateBack()) {
+    fun navigateBackFromDetail() {
+        isAddingSite = false
         scope.launch {
-            navigator.navigateBack()
+            if (navigator.canNavigateBack()) {
+                navigator.navigateBack(BackNavigationBehavior.PopUntilScaffoldValueChange)
+            } else {
+                navigator.navigateTo(ListDetailPaneScaffoldRole.List)
+            }
         }
+    }
+
+    BackHandler(enabled = isAddingSite || navigator.canNavigateBack()) {
+        navigateBackFromDetail()
     }
 
     ListDetailPaneScaffold(
@@ -55,42 +71,46 @@ fun DashboardScreen(
                 ListPaneContent(
                     items = uiState.mirrors,
                     onItemClick = { item ->
+                        isAddingSite = false
                         scope.launch {
                             navigator.navigateTo(ListDetailPaneScaffoldRole.Detail, item.id)
                         }
                     },
                     onAddClick = {
+                        isAddingSite = true
                         scope.launch {
-                            navigator.navigateTo(ListDetailPaneScaffoldRole.Detail, null)
+                            navigator.navigateTo(ListDetailPaneScaffoldRole.Detail)
                         }
-                    }
+                    },
                 )
             }
         },
         detailPane = {
             AnimatedPane {
                 val selectedItemId = navigator.currentDestination?.contentKey
-                val selectedItem = uiState.mirrors.find { it.id == selectedItemId }
+                val selectedItem = if (isAddingSite) null else uiState.mirrors.find { it.id == selectedItemId }
                 DetailPaneContent(
                     selectedItem = selectedItem,
+                    isAdding = isAddingSite,
                     isDownloading = uiState.isDownloading,
                     currentDownloadUrl = uiState.currentDownloadUrl,
                     downloadedCount = uiState.downloadedCount,
                     error = uiState.error,
                     onStartMirror = { url ->
                         viewModel.startMirror(url) { newMirrorId ->
+                            isAddingSite = false
                             scope.launch {
                                 navigator.navigateTo(ListDetailPaneScaffoldRole.Detail, newMirrorId)
                             }
                         }
                     },
                     onOpenMirror = { item -> onNavigateToViewer(item.id) },
-                    showBackButton = navigator.canNavigateBack(),
-                    onNavigateBack = {
-                        scope.launch {
-                            navigator.navigateBack()
-                        }
+                    onDeleteMirror = { item ->
+                        viewModel.deleteMirror(item.id)
+                        navigateBackFromDetail()
                     },
+                    showBackButton = isAddingSite || navigator.canNavigateBack(),
+                    onNavigateBack = { navigateBackFromDetail() },
                 )
             }
         }
@@ -143,19 +163,27 @@ private fun ListPaneContent(
 @Composable
 private fun DetailPaneContent(
     selectedItem: MirrorItem?,
+    isAdding: Boolean,
     isDownloading: Boolean,
     currentDownloadUrl: String,
     downloadedCount: Int,
     error: String?,
     onStartMirror: (String) -> Unit,
     onOpenMirror: (MirrorItem) -> Unit,
+    onDeleteMirror: (MirrorItem) -> Unit,
     showBackButton: Boolean = false,
     onNavigateBack: () -> Unit = {},
 ) {
+    val titleText = when {
+        isAdding -> "Add New Mirror"
+        selectedItem != null -> "Mirror Details"
+        else -> ""
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(if (selectedItem == null) "Add New Mirror" else "Mirror Details") },
+                title = { Text(titleText) },
                 navigationIcon = {
                     if (showBackButton) {
                         IconButton(onClick = onNavigateBack) {
@@ -174,18 +202,19 @@ private fun DetailPaneContent(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            if (selectedItem == null) {
+            if (isAdding) {
                 URLInputSection(
                     isDownloading = isDownloading,
                     currentDownloadUrl = currentDownloadUrl,
                     downloadedCount = downloadedCount,
                     error = error,
-                    onStartMirror = onStartMirror
+                    onStartMirror = onStartMirror,
                 )
-            } else {
+            } else if (selectedItem != null) {
                 MirrorInfoSection(
                     item = selectedItem,
-                    onOpenMirror = onOpenMirror
+                    onOpenMirror = onOpenMirror,
+                    onDeleteMirror = onDeleteMirror,
                 )
             }
         }
@@ -211,9 +240,25 @@ private fun URLInputSection(
         label = { Text("Website URL") },
         modifier = Modifier.fillMaxWidth(),
         enabled = !isDownloading,
+        isError = error != null,
+        supportingText = if (error != null) {
+            { Text(error, color = MaterialTheme.colorScheme.error) }
+        } else {
+            null
+        },
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(
+            keyboardType = KeyboardType.Uri,
+            imeAction = ImeAction.Go,
+        ),
+        keyboardActions = KeyboardActions(
+            onGo = {
+                if (!isDownloading && urlValue.text.isNotBlank()) {
+                    onStartMirror(urlValue.text)
+                }
+            },
+        ),
     )
-
-    if (error != null) Text(error, color = MaterialTheme.colorScheme.error)
 
     if (isDownloading) {
         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
@@ -237,13 +282,26 @@ private fun URLInputSection(
 @Composable
 private fun MirrorInfoSection(
     item: MirrorItem,
-    onOpenMirror: (MirrorItem) -> Unit
+    onOpenMirror: (MirrorItem) -> Unit,
+    onDeleteMirror: (MirrorItem) -> Unit,
 ) {
+    var showDeleteConfirmDialog by remember { mutableStateOf(value = false) }
+
     Card(
-        modifier = Modifier.fillMaxWidth()
+        modifier = Modifier.fillMaxWidth(),
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Text("URL: ${item.url}", style = MaterialTheme.typography.titleMedium)
+            Spacer(modifier = Modifier.height(8.dp))
+            Text("Downloaded: ${item.fileCount} files", style = MaterialTheme.typography.bodyMedium)
+            if (item.failureCount > 0) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    "Failed downloads: ${item.failureCount}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
             Spacer(modifier = Modifier.height(8.dp))
             Text("Storage Path: ${item.rootPath}", style = MaterialTheme.typography.bodySmall)
         }
@@ -251,11 +309,49 @@ private fun MirrorInfoSection(
 
     Button(
         onClick = { onOpenMirror(item) },
-        modifier = Modifier.fillMaxWidth()
+        modifier = Modifier.fillMaxWidth(),
     ) {
         Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null)
         Spacer(modifier = Modifier.width(8.dp))
         Text("Open Offline Content")
+    }
+
+    OutlinedButton(
+        onClick = { showDeleteConfirmDialog = true },
+        modifier = Modifier.fillMaxWidth(),
+        colors = ButtonDefaults.outlinedButtonColors(
+            contentColor = MaterialTheme.colorScheme.error,
+        ),
+    ) {
+        Icon(Icons.Default.Delete, contentDescription = null)
+        Spacer(modifier = Modifier.width(8.dp))
+        Text("Delete Mirror")
+    }
+
+    if (showDeleteConfirmDialog) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirmDialog = false },
+            title = { Text("Delete Mirror") },
+            text = { Text("Are you sure you want to delete the mirror for \"${item.url}\"? This will permanently delete all downloaded files.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showDeleteConfirmDialog = false
+                        onDeleteMirror(item)
+                    },
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error,
+                    ),
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteConfirmDialog = false }) {
+                    Text("Cancel")
+                }
+            },
+        )
     }
 }
 

@@ -5,6 +5,7 @@ import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
+import org.junit.Assert
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Rule
@@ -92,5 +93,43 @@ class MirrorEngineTest {
 
         assertTrue("d1.html should exist", File(rootDir, "d1.html").exists())
         assertTrue("d2.html should NOT exist (depth 2)", !File(rootDir, "d2.html").exists())
+    }
+
+    @Test
+    fun `test download failures are recorded`() = runBlocking {
+        val baseUrl = server.url("/").toString()
+
+        server.enqueue(MockResponse().setBody("""
+            <html>
+                <body>
+                    <img src="missing.png">
+                </body>
+            </html>
+        """).addHeader("Content-Type", "text/html"))
+
+        // missing.png returns 404
+        server.enqueue(MockResponse().setResponseCode(404))
+
+        engine.mirror(baseUrl, maxDepth = 1)
+
+        val missingUrl = server.url("/missing.png").toString()
+        assertTrue("Failures map should contain failed resource URL", engine.failedUrls.containsKey(missingUrl))
+    }
+
+    @Test
+    fun `test mirroring nonexistent site returns false and no files`() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(404))
+
+        val result = engine.mirror(server.url("/nonexistent").toString(), maxDepth = 1)
+
+        Assert.assertFalse("Mirror should return false for nonexistent site", result)
+        val files = rootDir.listFiles()?.filter { it.isFile } ?: emptyList()
+        assertTrue("No files should be downloaded", files.isEmpty())
+    }
+
+    @Test
+    fun `test invalid URL returns false`() = runBlocking {
+        val result = engine.mirror("invalid-url-schema", maxDepth = 1)
+        Assert.assertFalse("Mirror should return false for invalid URL", result)
     }
 }

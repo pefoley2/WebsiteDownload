@@ -18,24 +18,31 @@ class MirrorEngine(
     private val onProgress: (downloadedCount: Int, currentUrl: String) -> Unit = { _, _ -> },
 ) {
     private val tag = "MirrorEngine"
-    private val downloadedUrls = mutableSetOf<String>()
+    private val visitedUrls = mutableSetOf<String>()
+    private val failures = mutableMapOf<String, String>()
     private val downloadMutex = Mutex()
     private var downloadedCount = 0
+
+    val failedUrls: Map<String, String>
+        get() = failures.toMap()
 
     /**
      * Mirrors a website starting from the given [startUrl].
      * @param startUrl The initial URL to download.
      * @param maxDepth Maximum recursion depth for internal links.
+     * @return true if mirroring succeeded and at least one file was downloaded, false otherwise.
      */
-    suspend fun mirror(startUrl: String, maxDepth: Int = 2) = withContext(Dispatchers.IO) {
+    suspend fun mirror(startUrl: String, maxDepth: Int = 2): Boolean = withContext(Dispatchers.IO) {
         val httpUrl = startUrl.toHttpUrlOrNull()
         if (httpUrl == null) {
             Log.e(tag, "Invalid start URL: $startUrl")
-            return@withContext
+            failures[startUrl] = "Invalid start URL"
+            return@withContext false
         }
         val host = httpUrl.host
         
         downloadRecursive(httpUrl.toString(), host, 0, maxDepth)
+        downloadMutex.withLock { downloadedCount > 0 }
     }
 
     private suspend fun downloadRecursive(url: String, host: String, depth: Int, maxDepth: Int) {
@@ -44,14 +51,19 @@ class MirrorEngine(
         val normalizedUrl = normalizeUrl(url)
         
         downloadMutex.withLock {
-            if (downloadedUrls.contains(normalizedUrl)) return
-            downloadedUrls.add(normalizedUrl)
-            downloadedCount++
-            onProgress(downloadedCount, normalizedUrl)
+            if (visitedUrls.contains(normalizedUrl)) return
+            visitedUrls.add(normalizedUrl)
         }
 
         try {
-            val response = fetchUrl(normalizedUrl) ?: return
+            val response = fetchUrl(normalizedUrl)
+            if (response == null) {
+                downloadMutex.withLock {
+                    failures[normalizedUrl] = "Fetch failed or unsuccessful response"
+                }
+                return
+            }
+
             val contentType = response.contentType ?: ""
             val bodyBytes = response.bytes
 
@@ -68,6 +80,11 @@ class MirrorEngine(
                 // Write remapped HTML
                 localFile.writeText(doc.outerHtml())
                 
+                downloadMutex.withLock {
+                    downloadedCount++
+                    onProgress(downloadedCount, normalizedUrl)
+                }
+
                 // Recursively download next URLs
                 nextUrls.forEach { nextUrl ->
                     downloadRecursive(nextUrl, host, depth + 1, maxDepth)
@@ -76,6 +93,11 @@ class MirrorEngine(
                 // For images, CSS, etc.
                 localFile.writeBytes(bodyBytes)
                 
+                downloadMutex.withLock {
+                    downloadedCount++
+                    onProgress(downloadedCount, normalizedUrl)
+                }
+
                 if (contentType.contains("text/css")) {
                     val css = String(bodyBytes)
                     val nextUrls = collectFromCss(css, normalizedUrl)
@@ -86,6 +108,9 @@ class MirrorEngine(
             }
         } catch (e: Exception) {
             Log.e(tag, "Failed to download $url: ${e.message}")
+            downloadMutex.withLock {
+                failures[normalizedUrl] = e.message ?: "Unknown error"
+            }
         }
     }
 
