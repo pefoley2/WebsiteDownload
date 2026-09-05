@@ -11,7 +11,6 @@ import okhttp3.Request
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import java.io.File
-import java.net.URL
 
 class MirrorEngine(
     private val client: OkHttpClient,

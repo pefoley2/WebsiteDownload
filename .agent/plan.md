@@ -58,11 +58,11 @@ This application allows users to mirror and display offline copies of websites. 
 ### Task_4_RunAndVerify: Perform a final run of the application to ensure stability and alignment with the requirements. Verify the end-to-end flow from URL entry to offline browsing.
 - **Status:** COMPLETED
 - **Updates:** 1. App verified as stable by Critic agent.
-2. Crash during state restoration fixed and verified.
-3. Mirroring flow (Download -> Storage -> WebView) works end-to-end.
-4. Adaptive layout logic confirmed in code.
-5. Edge-to-edge implemented.
-6. Minor UX suggestions logged for future refinement.
+1. Crash during state restoration fixed and verified.
+2. Mirroring flow (Download -> Storage -> WebView) works end-to-end.
+3. Adaptive layout logic confirmed in code.
+4. Edge-to-edge implemented.
+5. Minor UX suggestions logged for future refinement.
 - **Acceptance Criteria:**
   - App builds successfully
   - App does not crash
