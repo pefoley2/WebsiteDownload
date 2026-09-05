@@ -9,7 +9,9 @@ plugins {
 android {
     namespace = "com.pefoley.websitedownload"
     compileSdk {
-        version = release(37)
+        version = release(37) {
+            minorApiLevel = 2
+        }
     }
 
     defaultConfig {
@@ -36,6 +38,8 @@ android {
     buildFeatures {
         compose = true
     }
+    buildToolsVersion = "37.0.0"
+    ndkVersion = "30.0.16138531 rc3"
 }
 
 dependencies {
