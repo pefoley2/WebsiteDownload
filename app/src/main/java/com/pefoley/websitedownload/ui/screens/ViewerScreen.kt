@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Toast
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
@@ -90,8 +91,18 @@ fun WebViewComponent(file: File, modifier: Modifier = Modifier) {
                         view: WebView?,
                         request: WebResourceRequest?
                     ): Boolean {
-                        // Keep navigation within the WebView if it's a local file
-                        return false 
+                        val uri = request?.url ?: return false
+                        // Allow local file navigation within the mirror
+                        if (uri.scheme == "file") {
+                            return false
+                        }
+                        // Block navigating to external links
+                        Toast.makeText(
+                            context,
+                            "External link blocked in offline mode",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                        return true
                     }
                 }
             }

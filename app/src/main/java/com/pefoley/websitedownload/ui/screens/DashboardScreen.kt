@@ -6,9 +6,10 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Language
-import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material3.*
 import androidx.compose.material3.adaptive.ExperimentalMaterial3AdaptiveApi
 import androidx.compose.material3.adaptive.layout.AnimatedPane
@@ -20,8 +21,10 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -74,8 +77,20 @@ fun DashboardScreen(
                     currentDownloadUrl = uiState.currentDownloadUrl,
                     downloadedCount = uiState.downloadedCount,
                     error = uiState.error,
-                    onStartMirror = { url -> viewModel.startMirror(url) },
-                    onOpenMirror = { item -> onNavigateToViewer(item.id) }
+                    onStartMirror = { url ->
+                        viewModel.startMirror(url) { newMirrorId ->
+                            scope.launch {
+                                navigator.navigateTo(ListDetailPaneScaffoldRole.Detail, newMirrorId)
+                            }
+                        }
+                    },
+                    onOpenMirror = { item -> onNavigateToViewer(item.id) },
+                    showBackButton = navigator.canNavigateBack(),
+                    onNavigateBack = {
+                        scope.launch {
+                            navigator.navigateBack()
+                        }
+                    },
                 )
             }
         }
@@ -133,11 +148,22 @@ private fun DetailPaneContent(
     downloadedCount: Int,
     error: String?,
     onStartMirror: (String) -> Unit,
-    onOpenMirror: (MirrorItem) -> Unit
+    onOpenMirror: (MirrorItem) -> Unit,
+    showBackButton: Boolean = false,
+    onNavigateBack: () -> Unit = {},
 ) {
     Scaffold(
         topBar = {
-            TopAppBar(title = { Text(if (selectedItem == null) "Add New Mirror" else "Mirror Details") })
+            TopAppBar(
+                title = { Text(if (selectedItem == null) "Add New Mirror" else "Mirror Details") },
+                navigationIcon = {
+                    if (showBackButton) {
+                        IconButton(onClick = onNavigateBack) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        }
+                    }
+                },
+            )
         }
     ) { padding ->
         Column(
@@ -172,16 +198,19 @@ private fun URLInputSection(
     currentDownloadUrl: String,
     downloadedCount: Int,
     error: String?,
-    onStartMirror: (String) -> Unit
+    onStartMirror: (String) -> Unit,
 ) {
-    var url by rememberSaveable { mutableStateOf("https://") }
+    var urlValue by rememberSaveable(stateSaver = TextFieldValue.Saver) {
+        val initialText = "https://"
+        mutableStateOf(TextFieldValue(initialText, TextRange(initialText.length)))
+    }
 
     OutlinedTextField(
-        value = url,
-        onValueChange = { url = it },
+        value = urlValue,
+        onValueChange = { urlValue = it },
         label = { Text("Website URL") },
         modifier = Modifier.fillMaxWidth(),
-        enabled = !isDownloading
+        enabled = !isDownloading,
     )
 
     if (error != null) Text(error, color = MaterialTheme.colorScheme.error)
@@ -193,12 +222,12 @@ private fun URLInputSection(
             currentDownloadUrl,
             style = MaterialTheme.typography.bodySmall,
             maxLines = 1,
-            overflow = TextOverflow.Ellipsis
+            overflow = TextOverflow.Ellipsis,
         )
     } else {
         Button(
-            onClick = { onStartMirror(url) },
-            modifier = Modifier.fillMaxWidth()
+            onClick = { onStartMirror(urlValue.text) },
+            modifier = Modifier.fillMaxWidth(),
         ) {
             Text("Start Mirroring")
         }

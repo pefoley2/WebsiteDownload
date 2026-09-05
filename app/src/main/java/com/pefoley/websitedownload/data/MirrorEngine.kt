@@ -55,7 +55,7 @@ class MirrorEngine(
             val contentType = response.contentType ?: ""
             val bodyBytes = response.bytes
 
-            val localFile = getLocalFile(normalizedUrl)
+            val localFile = getLocalFile(normalizedUrl, host)
             localFile.parentFile?.mkdirs()
 
             if (contentType.contains("text/html")) {
@@ -78,7 +78,7 @@ class MirrorEngine(
                 
                 if (contentType.contains("text/css")) {
                     val css = String(bodyBytes)
-                    val nextUrls = collectFromCss(css, normalizedUrl, host)
+                    val nextUrls = collectFromCss(css, normalizedUrl)
                     nextUrls.forEach { nextUrl ->
                         downloadRecursive(nextUrl, host, depth + 1, maxDepth)
                     }
@@ -93,7 +93,7 @@ class MirrorEngine(
         return url.toHttpUrlOrNull()?.newBuilder()?.fragment(null)?.build()?.toString() ?: url
     }
 
-    private fun collectFromCss(css: String, cssUrl: String, host: String): List<String> {
+    private fun collectFromCss(css: String, cssUrl: String): List<String> {
         val nextUrls = mutableListOf<String>()
         val regex = Regex("""url\(['"]?([^'")]+)['"]?\)""", RegexOption.IGNORE_CASE)
         val baseHttpUrl = cssUrl.toHttpUrlOrNull() ?: return emptyList()
@@ -102,7 +102,7 @@ class MirrorEngine(
             val relUrl = match.groupValues[1].trim()
             if (!relUrl.startsWith("data:")) {
                 val absUrl = baseHttpUrl.resolve(relUrl)?.toString()
-                if (absUrl != null && (absUrl.toHttpUrlOrNull()?.host == host)) {
+                if (absUrl != null) {
                     nextUrls.add(absUrl)
                 }
             }
@@ -118,12 +118,12 @@ class MirrorEngine(
                 val body = response.body
                 FetchResult(body.bytes(), response.header("Content-Type"))
             }
-        } catch (ignored: Exception) {
+        } catch (_: Exception) {
             null
         }
     }
 
-    private fun getLocalFile(urlStr: String): File {
+    private fun getLocalFile(urlStr: String, startHost: String = ""): File {
         val httpUrl = urlStr.toHttpUrlOrNull() ?: return File(rootDir, "error.html")
         val pathSegments = httpUrl.pathSegments
         
@@ -135,21 +135,36 @@ class MirrorEngine(
         } else if (!path.contains(".")) {
             path += ".html"
         }
-        
-        return File(rootDir, path)
+
+        return if (startHost.isNotEmpty() && httpUrl.host != startHost) {
+            val safeHost = httpUrl.host.replace(Regex("[^a-zA-Z0-9.-]"), "_")
+            File(File(rootDir, "_external/$safeHost"), path)
+        } else {
+            File(rootDir, path)
+        }
     }
 
     private fun remapAndCollect(doc: Document, currentUrl: String, host: String): List<String> {
         val nextUrls = mutableListOf<String>()
-        val currentFile = getLocalFile(currentUrl)
+        val currentFile = getLocalFile(currentUrl, host)
 
-        // Helper to handle various tags
-        fun remap(selector: String, attr: String) {
+        // Helper to handle elements: remapUrls(selector, attr, isNavigationLink)
+        fun remap(selector: String, attr: String, isNavigationLink: Boolean) {
             doc.select(selector).forEach { element ->
                 val absUrl = element.attr("abs:$attr")
-                val targetHttpUrl = absUrl.toHttpUrlOrNull()
-                if (targetHttpUrl != null && targetHttpUrl.host == host) {
-                    val targetFile = getLocalFile(absUrl)
+                val targetHttpUrl = absUrl.toHttpUrlOrNull() ?: return@forEach
+
+                if (isNavigationLink) {
+                    // For HTML hyperlinks (<a>): only follow and remap if on the same host
+                    if (targetHttpUrl.host == host) {
+                        val targetFile = getLocalFile(absUrl, host)
+                        val relativePath = getRelativePath(currentFile, targetFile)
+                        element.attr(attr, relativePath)
+                        nextUrls.add(absUrl)
+                    }
+                } else {
+                    // For embedded resources (img, stylesheet, script): save even if external
+                    val targetFile = getLocalFile(absUrl, host)
                     val relativePath = getRelativePath(currentFile, targetFile)
                     element.attr(attr, relativePath)
                     nextUrls.add(absUrl)
@@ -157,10 +172,10 @@ class MirrorEngine(
             }
         }
 
-        remap("a[href]", "href")
-        remap("img[src]", "src")
-        remap("link[href]", "href")
-        remap("script[src]", "src")
+        remap("a[href]", "href", isNavigationLink = true)
+        remap("img[src]", "src", isNavigationLink = false)
+        remap("link[href]", "href", isNavigationLink = false)
+        remap("script[src]", "src", isNavigationLink = false)
 
         return nextUrls
     }
@@ -171,7 +186,7 @@ class MirrorEngine(
         
         return try {
             fromPath.relativize(toPath).toString().replace("\\", "/")
-        } catch (ignored: Exception) {
+        } catch (_: Exception) {
             toFile.absolutePath.removePrefix(rootDir.absolutePath).removePrefix(File.separator).replace("\\", "/")
         }
     }

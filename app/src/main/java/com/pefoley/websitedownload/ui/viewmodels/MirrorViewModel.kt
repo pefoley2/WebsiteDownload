@@ -84,7 +84,7 @@ class MirrorViewModel(application: Application) : AndroidViewModel(application) 
         )
     }
 
-    fun startMirror(url: String) {
+    fun startMirror(url: String, onSuccess: (mirrorId: String) -> Unit = {}) {
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isDownloading = true, error = null, downloadedCount = 0)
             val mirrorId = url.replace(Regex("[^a-zA-Z0-9]"), "_")
@@ -119,6 +119,7 @@ class MirrorViewModel(application: Application) : AndroidViewModel(application) 
                     // Ignore metadata write failure
                 }
                 loadMirrors()
+                onSuccess(mirrorId)
             } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(error = e.message)
             } finally {
