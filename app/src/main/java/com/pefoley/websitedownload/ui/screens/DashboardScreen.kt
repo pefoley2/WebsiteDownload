@@ -107,7 +107,14 @@ private fun ListPaneContent(
             items(items) { item ->
                 ListItem(
                     headlineContent = { Text(item.url, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                    supportingContent = { Text("ID: ${item.id}") },
+                    supportingContent = {
+                        Text(
+                            when (item.fileCount) {
+                                1 -> "1 file downloaded"
+                                else -> "${item.fileCount} files downloaded"
+                            }
+                        )
+                    },
                     leadingContent = { Icon(Icons.Default.Language, contentDescription = null) },
                     modifier = Modifier.clickable { onItemClick(item) }
                 )

@@ -29,6 +29,7 @@ data class MirrorItem(
     val id: String,
     val url: String,
     val rootPath: String,
+    val fileCount: Int = 0,
 ) : Parcelable
 
 class MirrorViewModel(application: Application) : AndroidViewModel(application) {
@@ -51,25 +52,35 @@ class MirrorViewModel(application: Application) : AndroidViewModel(application) 
             ?.filter { it.isDirectory }
             ?.map { dir ->
                 val metadataFile = File(dir, "metadata.json")
-                if (metadataFile.exists()) {
+                val item = if (metadataFile.exists()) {
                     try {
                         Json.decodeFromString<MirrorItem>(metadataFile.readText())
-                    } catch (ignored: Exception) {
+                    } catch (_: Exception) {
                         fallbackMirrorItem(dir)
                     }
                 } else {
                     fallbackMirrorItem(dir)
+                }
+                if (item.fileCount <= 0) {
+                    item.copy(fileCount = countMirrorFiles(dir))
+                } else {
+                    item
                 }
             }
             ?.toList() ?: emptyList()
         _uiState.value = _uiState.value.copy(mirrors = items)
     }
 
+    private fun countMirrorFiles(dir: File): Int {
+        return dir.walkTopDown().count { it.isFile && (it.name != "metadata.json") }
+    }
+
     private fun fallbackMirrorItem(dir: File): MirrorItem {
         return MirrorItem(
             id = dir.name,
             url = dir.name.replace("___", "://").replace("_", "/"),
-            rootPath = dir.absolutePath
+            rootPath = dir.absolutePath,
+            fileCount = countMirrorFiles(dir),
         )
     }
 
@@ -87,19 +98,26 @@ class MirrorViewModel(application: Application) : AndroidViewModel(application) 
             val item = MirrorItem(id = mirrorId, url = url, rootPath = targetDir.absolutePath)
             try {
                 File(targetDir, "metadata.json").writeText(Json.encodeToString(item))
-            } catch (ignored: Exception) {
+            } catch (_: Exception) {
                 // Ignore metadata write failure for now
             }
             
             val engine = MirrorEngine(client, targetDir) { count, currentUrl ->
                 _uiState.value = _uiState.value.copy(
                     downloadedCount = count,
-                    currentDownloadUrl = currentUrl
+                    currentDownloadUrl = currentUrl,
                 )
             }
 
             try {
                 engine.mirror(url)
+                val finalCount = countMirrorFiles(targetDir)
+                val updatedItem = item.copy(fileCount = finalCount)
+                try {
+                    File(targetDir, "metadata.json").writeText(Json.encodeToString(updatedItem))
+                } catch (_: Exception) {
+                    // Ignore metadata write failure
+                }
                 loadMirrors()
             } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(error = e.message)

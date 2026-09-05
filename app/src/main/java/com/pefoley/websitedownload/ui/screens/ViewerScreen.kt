@@ -10,10 +10,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.viewinterop.AndroidView
+import org.json.JSONObject
 import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -27,15 +30,28 @@ fun ViewerScreen(
     val targetDir = File(mirrorsDir, mirrorId)
     val indexFile = File(targetDir, "index.html")
 
+    val displayTitle = remember(targetDir) {
+        val metadataFile = File(targetDir, "metadata.json")
+        if (metadataFile.exists()) {
+            try {
+                JSONObject(metadataFile.readText()).optString("url").takeIf { it.isNotBlank() }
+            } catch (_: Exception) {
+                null
+            }
+        } else {
+            null
+        } ?: mirrorId.replace("___", "://").replace("_", "/")
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Offline Viewer: $mirrorId") },
+                title = { Text(displayTitle, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 navigationIcon = {
                     IconButton(onClick = onNavigateBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
-                }
+                },
             )
         }
     ) { innerPadding ->
