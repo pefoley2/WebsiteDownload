@@ -20,7 +20,7 @@ import java.io.File
 @Composable
 fun ViewerScreen(
     mirrorId: String,
-    onNavigateBack: () -> Unit
+    onNavigateBack: () -> Unit,
 ) {
     val context = LocalContext.current
     val mirrorsDir = File(context.filesDir, "mirrors")
@@ -81,9 +81,7 @@ fun WebViewComponent(file: File, modifier: Modifier = Modifier) {
             }
         },
         modifier = modifier,
-        update = { webView ->
-            webView.loadUrl("file://${file.absolutePath}")
-        }
+        update = { webView -> webView.loadUrl("file://${file.absolutePath}") }
     )
 }
 

@@ -20,7 +20,7 @@ data class MirrorState(
     val isDownloading: Boolean = false,
     val currentDownloadUrl: String = "",
     val downloadedCount: Int = 0,
-    val error: String? = null
+    val error: String? = null,
 )
 
 @Serializable
@@ -28,7 +28,7 @@ data class MirrorState(
 data class MirrorItem(
     val id: String,
     val url: String,
-    val rootPath: String
+    val rootPath: String,
 ) : Parcelable
 
 class MirrorViewModel(application: Application) : AndroidViewModel(application) {
@@ -46,18 +46,22 @@ class MirrorViewModel(application: Application) : AndroidViewModel(application) 
         if (!mirrorsDir.exists()) {
             mirrorsDir.mkdirs()
         }
-        val items = mirrorsDir.listFiles()?.filter { it.isDirectory }?.map { dir ->
-            val metadataFile = File(dir, "metadata.json")
-            if (metadataFile.exists()) {
-                try {
-                    Json.decodeFromString<MirrorItem>(metadataFile.readText())
-                } catch (e: Exception) {
+        val items = mirrorsDir.listFiles()
+            ?.asSequence()
+            ?.filter { it.isDirectory }
+            ?.map { dir ->
+                val metadataFile = File(dir, "metadata.json")
+                if (metadataFile.exists()) {
+                    try {
+                        Json.decodeFromString<MirrorItem>(metadataFile.readText())
+                    } catch (ignored: Exception) {
+                        fallbackMirrorItem(dir)
+                    }
+                } else {
                     fallbackMirrorItem(dir)
                 }
-            } else {
-                fallbackMirrorItem(dir)
             }
-        } ?: emptyList()
+            ?.toList() ?: emptyList()
         _uiState.value = _uiState.value.copy(mirrors = items)
     }
 
@@ -83,7 +87,7 @@ class MirrorViewModel(application: Application) : AndroidViewModel(application) 
             val item = MirrorItem(id = mirrorId, url = url, rootPath = targetDir.absolutePath)
             try {
                 File(targetDir, "metadata.json").writeText(Json.encodeToString(item))
-            } catch (e: Exception) {
+            } catch (ignored: Exception) {
                 // Ignore metadata write failure for now
             }
             

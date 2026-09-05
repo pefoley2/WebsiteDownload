@@ -6,5 +6,4 @@ import kotlinx.serialization.Serializable
 
 @Parcelize
 @Serializable
-enum class MirrorStatus : Parcelable {
-}
+enum class MirrorStatus : Parcelable

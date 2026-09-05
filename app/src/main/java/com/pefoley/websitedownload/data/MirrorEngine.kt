@@ -15,9 +15,9 @@ import java.io.File
 class MirrorEngine(
     private val client: OkHttpClient,
     private val rootDir: File,
-    private val onProgress: (downloadedCount: Int, currentUrl: String) -> Unit = { _, _ -> }
+    private val onProgress: (downloadedCount: Int, currentUrl: String) -> Unit = { _, _ -> },
 ) {
-    private val TAG = "MirrorEngine"
+    private val tag = "MirrorEngine"
     private val downloadedUrls = mutableSetOf<String>()
     private val downloadMutex = Mutex()
     private var downloadedCount = 0
@@ -30,7 +30,7 @@ class MirrorEngine(
     suspend fun mirror(startUrl: String, maxDepth: Int = 2) = withContext(Dispatchers.IO) {
         val httpUrl = startUrl.toHttpUrlOrNull()
         if (httpUrl == null) {
-            Log.e(TAG, "Invalid start URL: $startUrl")
+            Log.e(tag, "Invalid start URL: $startUrl")
             return@withContext
         }
         val host = httpUrl.host
@@ -85,7 +85,7 @@ class MirrorEngine(
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to download $url: ${e.message}")
+            Log.e(tag, "Failed to download $url: ${e.message}")
         }
     }
 
@@ -102,7 +102,7 @@ class MirrorEngine(
             val relUrl = match.groupValues[1].trim()
             if (!relUrl.startsWith("data:")) {
                 val absUrl = baseHttpUrl.resolve(relUrl)?.toString()
-                if (absUrl != null && absUrl.toHttpUrlOrNull()?.host == host) {
+                if (absUrl != null && (absUrl.toHttpUrlOrNull()?.host == host)) {
                     nextUrls.add(absUrl)
                 }
             }
@@ -115,10 +115,10 @@ class MirrorEngine(
         try {
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) return@withContext null
-                val body = response.body ?: return@withContext null
+                val body = response.body
                 FetchResult(body.bytes(), response.header("Content-Type"))
             }
-        } catch (e: Exception) {
+        } catch (ignored: Exception) {
             null
         }
     }
@@ -128,7 +128,7 @@ class MirrorEngine(
         val pathSegments = httpUrl.pathSegments
         
         var path = pathSegments.joinToString("/")
-        if (path.isEmpty() || path == "/") {
+        if ((path.isEmpty()) || path == "/") {
             path = "index.html"
         } else if (httpUrl.encodedPath.endsWith("/")) {
             path = if (path.isEmpty()) "index.html" else "$path/index.html"
@@ -171,7 +171,7 @@ class MirrorEngine(
         
         return try {
             fromPath.relativize(toPath).toString().replace("\\", "/")
-        } catch (e: Exception) {
+        } catch (ignored: Exception) {
             toFile.absolutePath.removePrefix(rootDir.absolutePath).removePrefix(File.separator).replace("\\", "/")
         }
     }

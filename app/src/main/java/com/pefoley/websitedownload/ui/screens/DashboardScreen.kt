@@ -32,7 +32,7 @@ import com.pefoley.websitedownload.ui.viewmodels.MirrorViewModel
 @Composable
 fun DashboardScreen(
     onNavigateToViewer: (String) -> Unit,
-    viewModel: MirrorViewModel = viewModel()
+    viewModel: MirrorViewModel = viewModel(),
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val navigator = rememberListDetailPaneScaffoldNavigator<String>()
@@ -177,9 +177,7 @@ private fun URLInputSection(
         enabled = !isDownloading
     )
 
-    if (error != null) {
-        Text(error, color = MaterialTheme.colorScheme.error)
-    }
+    if (error != null) Text(error, color = MaterialTheme.colorScheme.error)
 
     if (isDownloading) {
         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())

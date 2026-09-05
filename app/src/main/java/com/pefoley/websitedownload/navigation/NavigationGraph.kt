@@ -18,13 +18,15 @@ fun NavigationGraph() {
             when (key) {
                 is Dashboard -> NavEntry(key) {
                     DashboardScreen(
-                        onNavigateToViewer = { id -> backStack.add(Viewer(id)) }
+                        onNavigateToViewer = { id -> backStack.add(Viewer(id)) },
                     )
                 }
                 is Viewer -> NavEntry(key) {
                     ViewerScreen(
                         mirrorId = key.mirrorId,
-                        onNavigateBack = { if (backStack.isNotEmpty()) backStack.removeAt(backStack.size - 1) }
+                        onNavigateBack = {
+                            if (backStack.isNotEmpty()) backStack.removeAt(backStack.size - 1)
+                        },
                     )
                 }
                 else -> error("Unknown key: $key")
