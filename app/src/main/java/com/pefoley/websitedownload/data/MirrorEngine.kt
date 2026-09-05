@@ -57,15 +57,16 @@ class MirrorEngine(
 
         try {
             val response = fetchUrl(normalizedUrl)
-            if (response == null) {
+            if (response is FetchResult.Failure) {
                 downloadMutex.withLock {
-                    failures[normalizedUrl] = "Fetch failed or unsuccessful response"
+                    failures[normalizedUrl] = response.error
                 }
                 return
             }
 
-            val contentType = response.contentType ?: ""
-            val bodyBytes = response.bytes
+            val success = response as FetchResult.Success
+            val contentType = success.contentType ?: ""
+            val bodyBytes = success.bytes
 
             val localFile = getLocalFile(normalizedUrl, host)
             localFile.parentFile?.mkdirs()
@@ -135,16 +136,18 @@ class MirrorEngine(
         return nextUrls
     }
 
-    private suspend fun fetchUrl(url: String): FetchResult? = withContext(Dispatchers.IO) {
+    private suspend fun fetchUrl(url: String): FetchResult = withContext(Dispatchers.IO) {
         val request = Request.Builder().url(url).build()
         try {
             client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return@withContext null
+                if (!response.isSuccessful) {
+                    return@withContext FetchResult.Failure("HTTP ${response.code}: ${response.message}")
+                }
                 val body = response.body
-                FetchResult(body.bytes(), response.header("Content-Type"))
+                FetchResult.Success(body.bytes(), response.header("Content-Type"))
             }
-        } catch (_: Exception) {
-            null
+        } catch (e: Exception) {
+            FetchResult.Failure(e.message ?: e.javaClass.simpleName)
         }
     }
 
@@ -216,5 +219,8 @@ class MirrorEngine(
         }
     }
 
-    private class FetchResult(val bytes: ByteArray, val contentType: String?)
+    private sealed interface FetchResult {
+        class Success(val bytes: ByteArray, val contentType: String?) : FetchResult
+        class Failure(val error: String) : FetchResult
+    }
 }

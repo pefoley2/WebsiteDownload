@@ -93,6 +93,17 @@ class MirrorViewModel(application: Application) : AndroidViewModel(application) 
         loadMirrors()
     }
 
+    fun getFailedUrls(mirrorId: String): Map<String, String> {
+        val targetDir = File(mirrorsDir, mirrorId)
+        val failuresFile = File(targetDir, "failures.json")
+        if (!failuresFile.exists()) return emptyMap()
+        return try {
+            Json.decodeFromString<Map<String, String>>(failuresFile.readText())
+        } catch (_: Exception) {
+            emptyMap()
+        }
+    }
+
     fun startMirror(url: String, onSuccess: (mirrorId: String) -> Unit = {}) {
         val mirrorId = url.replace(Regex("[^a-zA-Z0-9]"), "_")
         if (_uiState.value.mirrors.any { (it.id == mirrorId) || it.url.equals(url, ignoreCase = true) }) {

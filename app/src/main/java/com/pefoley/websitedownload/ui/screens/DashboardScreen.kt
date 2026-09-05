@@ -109,6 +109,7 @@ fun DashboardScreen(
                         viewModel.deleteMirror(item.id)
                         navigateBackFromDetail()
                     },
+                    getFailedUrls = { mirrorId -> viewModel.getFailedUrls(mirrorId) },
                     showBackButton = isAddingSite || navigator.canNavigateBack(),
                     onNavigateBack = { navigateBackFromDetail() },
                 )
@@ -171,6 +172,7 @@ private fun DetailPaneContent(
     onStartMirror: (String) -> Unit,
     onOpenMirror: (MirrorItem) -> Unit,
     onDeleteMirror: (MirrorItem) -> Unit,
+    getFailedUrls: (String) -> Map<String, String>,
     showBackButton: Boolean = false,
     onNavigateBack: () -> Unit = {},
 ) {
@@ -198,6 +200,8 @@ private fun DetailPaneContent(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
+                .consumeWindowInsets(padding)
+                .imePadding()
                 .padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(16.dp)
@@ -215,6 +219,7 @@ private fun DetailPaneContent(
                     item = selectedItem,
                     onOpenMirror = onOpenMirror,
                     onDeleteMirror = onDeleteMirror,
+                    getFailedUrls = getFailedUrls,
                 )
             }
         }
@@ -284,8 +289,10 @@ private fun MirrorInfoSection(
     item: MirrorItem,
     onOpenMirror: (MirrorItem) -> Unit,
     onDeleteMirror: (MirrorItem) -> Unit,
+    getFailedUrls: (String) -> Map<String, String> = { emptyMap() },
 ) {
     var showDeleteConfirmDialog by remember { mutableStateOf(value = false) }
+    var showFailuresDialog by remember { mutableStateOf(value = false) }
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -296,11 +303,23 @@ private fun MirrorInfoSection(
             Text("Downloaded: ${item.fileCount} files", style = MaterialTheme.typography.bodyMedium)
             if (item.failureCount > 0) {
                 Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    "Failed downloads: ${item.failureCount}",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.error,
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        "Failed downloads: ${item.failureCount}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    TextButton(
+                        onClick = { showFailuresDialog = true },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                    ) {
+                        Text("View Details")
+                    }
+                }
             }
             Spacer(modifier = Modifier.height(8.dp))
             Text("Storage Path: ${item.rootPath}", style = MaterialTheme.typography.bodySmall)
@@ -349,6 +368,52 @@ private fun MirrorInfoSection(
             dismissButton = {
                 TextButton(onClick = { showDeleteConfirmDialog = false }) {
                     Text("Cancel")
+                }
+            },
+        )
+    }
+
+    if (showFailuresDialog) {
+        val failedUrls = remember(item.id) { getFailedUrls(item.id) }
+        AlertDialog(
+            onDismissRequest = { showFailuresDialog = false },
+            title = { Text("Failed Downloads (${failedUrls.size})") },
+            text = {
+                if (failedUrls.isEmpty()) {
+                    Text("No failure details available.")
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 350.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        items(failedUrls.toList()) { (url, error) ->
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 4.dp),
+                            ) {
+                                Text(
+                                    text = url,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                )
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = error,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error,
+                                )
+                            }
+                            HorizontalDivider()
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showFailuresDialog = false }) {
+                    Text("Close")
                 }
             },
         )
