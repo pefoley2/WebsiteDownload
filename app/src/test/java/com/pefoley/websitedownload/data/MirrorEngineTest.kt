@@ -132,4 +132,75 @@ class MirrorEngineTest {
         val result = engine.mirror("invalid-url-schema", maxDepth = 1)
         Assert.assertFalse("Mirror should return false for invalid URL", result)
     }
+
+    @Test
+    fun `test incremental refresh with 304 not modified`() = runBlocking {
+        val baseUrl = server.url("/").toString()
+
+        // First mirror
+        server.enqueue(
+            MockResponse()
+                .setBody("""
+                    <html>
+                        <head><title>Test</title></head>
+                        <body>
+                            <a href="page2.html">Page 2</a>
+                        </body>
+                    </html>
+                """.trimIndent())
+                .setHeader("Content-Type", "text/html")
+                .setHeader("ETag", "\"etag-v1\"")
+        )
+
+        server.enqueue(
+            MockResponse()
+                .setBody("<html><body>Page 2 v1</body></html>")
+                .setHeader("Content-Type", "text/html")
+                .setHeader("ETag", "\"p2-etag-v1\"")
+        )
+
+        engine.mirror(baseUrl, maxDepth = 1)
+
+        val indexFile = File(rootDir, "index.html")
+        val page2File = File(rootDir, "page2.html")
+        assertTrue(indexFile.exists())
+        assertTrue(page2File.exists())
+        assertTrue(page2File.readText().contains("Page 2 v1"))
+
+        // Drain first batch of requests from server
+        server.takeRequest() // index.html
+        server.takeRequest() // page2.html
+
+        // Refresh:
+        // index.html returns 304 Not Modified
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(304)
+                .setHeader("ETag", "\"etag-v1\"")
+        )
+        // page2.html returns 200 with updated content
+        server.enqueue(
+            MockResponse()
+                .setBody("<html><body>Page 2 v2 Updated</body></html>")
+                .setHeader("Content-Type", "text/html")
+                .setHeader("ETag", "\"p2-etag-v2\"")
+        )
+
+        // Run mirror again with fresh engine instance on same rootDir (simulates app restart or subsequent refresh)
+        val refreshEngine = MirrorEngine(client, rootDir)
+        val refreshSuccess = refreshEngine.mirror(baseUrl, maxDepth = 1)
+
+        assertTrue("Refresh should succeed", refreshSuccess)
+
+        // Verify conditional headers were sent
+        val req1 = server.takeRequest()
+        Assert.assertEquals("\"etag-v1\"", req1.getHeader("If-None-Match"))
+
+        val req2 = server.takeRequest()
+        Assert.assertEquals("\"p2-etag-v1\"", req2.getHeader("If-None-Match"))
+
+        // Verify page2 was updated and index was preserved
+        assertTrue("index.html should still exist", indexFile.exists())
+        assertTrue("page2.html should be updated to v2", page2File.readText().contains("Page 2 v2 Updated"))
+    }
 }

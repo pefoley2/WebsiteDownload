@@ -11,6 +11,7 @@ import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Language
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.material3.adaptive.ExperimentalMaterial3AdaptiveApi
 import androidx.compose.material3.adaptive.layout.AnimatedPane
@@ -36,6 +37,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.pefoley.websitedownload.ui.viewmodels.MirrorItem
 import com.pefoley.websitedownload.ui.viewmodels.MirrorViewModel
+import java.text.SimpleDateFormat
+import java.util.Date
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3AdaptiveApi::class)
 @Composable
@@ -93,8 +96,10 @@ fun DashboardScreen(
                     selectedItem = selectedItem,
                     isAdding = isAddingSite,
                     isDownloading = uiState.isDownloading,
+                    activeMirrorId = uiState.activeMirrorId,
                     currentDownloadUrl = uiState.currentDownloadUrl,
                     downloadedCount = uiState.downloadedCount,
+                    unchangedCount = uiState.unchangedCount,
                     error = uiState.error,
                     onStartMirror = { url ->
                         viewModel.startMirror(url) { newMirrorId ->
@@ -103,6 +108,9 @@ fun DashboardScreen(
                                 navigator.navigateTo(ListDetailPaneScaffoldRole.Detail, newMirrorId)
                             }
                         }
+                    },
+                    onRefreshMirror = { mirrorId ->
+                        viewModel.refreshMirror(mirrorId)
                     },
                     onOpenMirror = { item -> onNavigateToViewer(item.id) },
                     onDeleteMirror = { item ->
@@ -166,10 +174,13 @@ private fun DetailPaneContent(
     selectedItem: MirrorItem?,
     isAdding: Boolean,
     isDownloading: Boolean,
+    activeMirrorId: String?,
     currentDownloadUrl: String,
     downloadedCount: Int,
+    unchangedCount: Int,
     error: String?,
     onStartMirror: (String) -> Unit,
+    onRefreshMirror: (String) -> Unit,
     onOpenMirror: (MirrorItem) -> Unit,
     onDeleteMirror: (MirrorItem) -> Unit,
     getFailedUrls: (String) -> Map<String, String>,
@@ -215,8 +226,14 @@ private fun DetailPaneContent(
                     onStartMirror = onStartMirror,
                 )
             } else if (selectedItem != null) {
+                val isCurrentMirrorDownloading = isDownloading && (activeMirrorId == selectedItem.id)
                 MirrorInfoSection(
                     item = selectedItem,
+                    isRefreshing = isCurrentMirrorDownloading,
+                    currentDownloadUrl = currentDownloadUrl,
+                    downloadedCount = downloadedCount,
+                    unchangedCount = unchangedCount,
+                    onRefreshMirror = { onRefreshMirror(selectedItem.id) },
                     onOpenMirror = onOpenMirror,
                     onDeleteMirror = onDeleteMirror,
                     getFailedUrls = getFailedUrls,
@@ -287,6 +304,11 @@ private fun URLInputSection(
 @Composable
 private fun MirrorInfoSection(
     item: MirrorItem,
+    isRefreshing: Boolean = false,
+    currentDownloadUrl: String = "",
+    downloadedCount: Int = 0,
+    unchangedCount: Int = 0,
+    onRefreshMirror: () -> Unit = {},
     onOpenMirror: (MirrorItem) -> Unit,
     onDeleteMirror: (MirrorItem) -> Unit,
     getFailedUrls: (String) -> Map<String, String> = { emptyMap() },
@@ -301,6 +323,13 @@ private fun MirrorInfoSection(
             Text("URL: ${item.url}", style = MaterialTheme.typography.titleMedium)
             Spacer(modifier = Modifier.height(8.dp))
             Text("Downloaded: ${item.fileCount} files", style = MaterialTheme.typography.bodyMedium)
+            if (item.lastRefreshedAt > 0L) {
+                Spacer(modifier = Modifier.height(4.dp))
+                val formattedDate = remember(item.lastRefreshedAt) {
+                    SimpleDateFormat.getDateTimeInstance().format(Date(item.lastRefreshedAt))
+                }
+                Text("Last refreshed: $formattedDate", style = MaterialTheme.typography.bodySmall)
+            }
             if (item.failureCount > 0) {
                 Spacer(modifier = Modifier.height(4.dp))
                 Row(
@@ -326,9 +355,37 @@ private fun MirrorInfoSection(
         }
     }
 
+    if (isRefreshing) {
+        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        val progressText = if (unchangedCount > 0) {
+            "Refreshing: $downloadedCount updated, $unchangedCount unchanged"
+        } else {
+            "Refreshing: $downloadedCount files"
+        }
+        Text(progressText, style = MaterialTheme.typography.bodyMedium)
+        if (currentDownloadUrl.isNotBlank()) {
+            Text(
+                currentDownloadUrl,
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    } else {
+        FilledTonalButton(
+            onClick = onRefreshMirror,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Icon(Icons.Default.Refresh, contentDescription = null)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Refresh Site")
+        }
+    }
+
     Button(
         onClick = { onOpenMirror(item) },
         modifier = Modifier.fillMaxWidth(),
+        enabled = !isRefreshing,
     ) {
         Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null)
         Spacer(modifier = Modifier.width(8.dp))
@@ -338,6 +395,7 @@ private fun MirrorInfoSection(
     OutlinedButton(
         onClick = { showDeleteConfirmDialog = true },
         modifier = Modifier.fillMaxWidth(),
+        enabled = !isRefreshing,
         colors = ButtonDefaults.outlinedButtonColors(
             contentColor = MaterialTheme.colorScheme.error,
         ),

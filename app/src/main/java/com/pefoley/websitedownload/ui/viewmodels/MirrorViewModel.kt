@@ -20,6 +20,8 @@ data class MirrorState(
     val isDownloading: Boolean = false,
     val currentDownloadUrl: String = "",
     val downloadedCount: Int = 0,
+    val unchangedCount: Int = 0,
+    val activeMirrorId: String? = null,
     val error: String? = null,
 )
 
@@ -31,6 +33,7 @@ data class MirrorItem(
     val rootPath: String,
     val fileCount: Int = 0,
     val failureCount: Int = 0,
+    val lastRefreshedAt: Long = 0L,
 ) : Parcelable
 
 class MirrorViewModel(application: Application) : AndroidViewModel(application) {
@@ -73,7 +76,7 @@ class MirrorViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun countMirrorFiles(dir: File): Int {
-        return dir.walkTopDown().count { it.isFile && (it.name != "metadata.json") }
+        return dir.walkTopDown().count { it.isFile && (it.name != "metadata.json") && (it.name != "cache_index.json") && (it.name != "failures.json") }
     }
 
     private fun fallbackMirrorItem(dir: File): MirrorItem {
@@ -112,7 +115,13 @@ class MirrorViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(isDownloading = true, error = null, downloadedCount = 0)
+            _uiState.value = _uiState.value.copy(
+                isDownloading = true,
+                error = null,
+                downloadedCount = 0,
+                unchangedCount = 0,
+                activeMirrorId = mirrorId,
+            )
             val targetDir = File(mirrorsDir, mirrorId)
             
             if (!targetDir.exists()) {
@@ -120,17 +129,23 @@ class MirrorViewModel(application: Application) : AndroidViewModel(application) 
             }
             
             // Save metadata
-            val item = MirrorItem(id = mirrorId, url = url, rootPath = targetDir.absolutePath)
+            val item = MirrorItem(
+                id = mirrorId,
+                url = url,
+                rootPath = targetDir.absolutePath,
+                lastRefreshedAt = System.currentTimeMillis(),
+            )
             try {
                 File(targetDir, "metadata.json").writeText(Json.encodeToString(item))
             } catch (_: Exception) {
                 // Ignore metadata write failure for now
             }
             
-            val engine = MirrorEngine(client, targetDir) { count, currentUrl ->
+            val engine = MirrorEngine(client, targetDir) { progress ->
                 _uiState.value = _uiState.value.copy(
-                    downloadedCount = count,
-                    currentDownloadUrl = currentUrl,
+                    downloadedCount = progress.downloadedCount,
+                    unchangedCount = progress.unchangedCount,
+                    currentDownloadUrl = progress.currentUrl,
                 )
             }
 
@@ -149,6 +164,7 @@ class MirrorViewModel(application: Application) : AndroidViewModel(application) 
                     val updatedItem = item.copy(
                         fileCount = finalCount,
                         failureCount = failures.size,
+                        lastRefreshedAt = System.currentTimeMillis(),
                     )
                     try {
                         File(targetDir, "metadata.json").writeText(Json.encodeToString(updatedItem))
@@ -167,7 +183,59 @@ class MirrorViewModel(application: Application) : AndroidViewModel(application) 
                 }
                 _uiState.value = _uiState.value.copy(error = e.message ?: "Download failed")
             } finally {
-                _uiState.value = _uiState.value.copy(isDownloading = false)
+                _uiState.value = _uiState.value.copy(isDownloading = false, activeMirrorId = null)
+            }
+        }
+    }
+
+    fun refreshMirror(mirrorId: String, onSuccess: () -> Unit = {}) {
+        val existingItem = _uiState.value.mirrors.find { it.id == mirrorId } ?: return
+        val targetDir = File(mirrorsDir, mirrorId)
+        if (!targetDir.exists()) return
+
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                isDownloading = true,
+                error = null,
+                downloadedCount = 0,
+                unchangedCount = 0,
+                activeMirrorId = mirrorId,
+            )
+
+            val engine = MirrorEngine(client, targetDir) { progress ->
+                _uiState.value = _uiState.value.copy(
+                    downloadedCount = progress.downloadedCount,
+                    unchangedCount = progress.unchangedCount,
+                    currentDownloadUrl = progress.currentUrl,
+                )
+            }
+
+            try {
+                val success = engine.mirror(existingItem.url)
+                val finalCount = countMirrorFiles(targetDir)
+                val failures = engine.failedUrls
+
+                if (success) {
+                    val updatedItem = existingItem.copy(
+                        fileCount = finalCount,
+                        failureCount = failures.size,
+                        lastRefreshedAt = System.currentTimeMillis(),
+                    )
+                    try {
+                        File(targetDir, "metadata.json").writeText(Json.encodeToString(updatedItem))
+                        File(targetDir, "failures.json").writeText(Json.encodeToString(failures))
+                    } catch (_: Exception) {
+                        // Ignore metadata write failure
+                    }
+                    loadMirrors()
+                    onSuccess()
+                } else {
+                    _uiState.value = _uiState.value.copy(error = "Refresh failed: could not reach host")
+                }
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(error = e.message ?: "Refresh failed")
+            } finally {
+                _uiState.value = _uiState.value.copy(isDownloading = false, activeMirrorId = null)
             }
         }
     }
