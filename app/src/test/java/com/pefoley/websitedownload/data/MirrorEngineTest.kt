@@ -1,6 +1,7 @@
 package com.pefoley.websitedownload.data
 
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -12,6 +13,8 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
+import java.util.concurrent.TimeUnit
+import kotlin.time.Duration.Companion.milliseconds
 
 class MirrorEngineTest {
 
@@ -442,6 +445,75 @@ class MirrorEngineTest {
         val recordedRequests = (1..server.requestCount).map { server.takeRequest().path }
         val sharedCssRequests = recordedRequests.filter { it == "/shared.css" }
         Assert.assertEquals("shared.css should only be requested once despite multiple references", 1, sharedCssRequests.size)
+    }
+
+    @Test
+    fun `test refresh with external resource preserves original url`() = runBlocking<Unit> {
+        withTimeout(10000.milliseconds) {
+            val externalServer = MockWebServer()
+            externalServer.start()
+            try {
+                val baseUrl = "http://127.0.0.1:${server.port}/"
+                val externalUrl = "http://localhost:${externalServer.port}/image.png"
+                val externalHost = "localhost"
+
+                server.enqueue(
+                    MockResponse().setBody(
+                        """
+                    <html>
+                        <body>
+                            <img src="$externalUrl">
+                        </body>
+                    </html>
+                """.trimIndent()
+                    ).addHeader("Content-Type", "text/html").addHeader("ETag", "v1")
+                )
+
+                externalServer.enqueue(
+                    MockResponse().setBody("external-data").addHeader("Content-Type", "image/png")
+                )
+
+                engine.mirror(baseUrl, maxDepth = 1)
+
+                val indexFile = File(rootDir, "index.html")
+                val indexHtml = indexFile.readText()
+                assertTrue(
+                    "Image should be remapped to _external. Found: $indexHtml",
+                    indexHtml.contains("src=\"_external/$externalHost/image.png\"")
+                )
+
+                server.enqueue(MockResponse().setResponseCode(304).addHeader("ETag", "v1"))
+                externalServer.enqueue(MockResponse().setResponseCode(304))
+
+                val refreshEngine = MirrorEngine(client, rootDir)
+                val success = refreshEngine.mirror(baseUrl, maxDepth = 1)
+                assertTrue("Refresh should succeed", success)
+
+                Assert.assertEquals(
+                    "Main server should have exactly 2 requests",
+                    2,
+                    server.requestCount
+                )
+                Assert.assertEquals(
+                    "External server should have exactly 2 requests",
+                    2,
+                    externalServer.requestCount
+                )
+
+                val req1 = server.takeRequest(5, TimeUnit.SECONDS)
+                val req2 = server.takeRequest(5, TimeUnit.SECONDS)
+                Assert.assertEquals("/", req1?.path)
+                Assert.assertEquals("/", req2?.path)
+
+                val extReq1 = externalServer.takeRequest(5, TimeUnit.SECONDS)
+                val extReq2 = externalServer.takeRequest(5, TimeUnit.SECONDS)
+                Assert.assertEquals("/image.png", extReq1?.path)
+                Assert.assertEquals("/image.png", extReq2?.path)
+
+            } finally {
+                externalServer.shutdown()
+            }
+        }
     }
 }
 

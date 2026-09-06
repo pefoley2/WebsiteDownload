@@ -23,6 +23,7 @@ data class CacheEntry(
     val etag: String? = null,
     val lastModified: String? = null,
     val contentType: String? = null,
+    val children: List<String> = emptyList(),
 )
 
 data class MirrorProgress(
@@ -37,7 +38,7 @@ data class MirrorProgress(
 class MirrorEngine(
     private val client: OkHttpClient,
     private val rootDir: File,
-    maxConcurrency: Int = 8,
+    maxConcurrency: Int = 4,
     private val onProgress: (progress: MirrorProgress) -> Unit = {},
 ) {
     private val tag = "MirrorEngine"
@@ -45,11 +46,15 @@ class MirrorEngine(
     private val failures = mutableMapOf<String, String>()
     private val cacheMap = mutableMapOf<String, CacheEntry>()
     private val downloadMutex = Mutex()
-    private val semaphore = Semaphore(maxConcurrency)
+    private val concurrencySemaphore = Semaphore(maxConcurrency)
     private var downloadedCount = 0
     private var unchangedCount = 0
     private var lastProgressReportTime = 0L
     private val cacheFile = File(rootDir, "cache_index.json")
+    private val json = Json {
+        ignoreUnknownKeys = true
+        encodeDefaults = true
+    }
 
     init {
         loadCache()
@@ -58,7 +63,7 @@ class MirrorEngine(
     private fun loadCache() {
         if (cacheFile.exists()) {
             try {
-                val loaded = Json.decodeFromString<Map<String, CacheEntry>>(cacheFile.readText())
+                val loaded = json.decodeFromString<Map<String, CacheEntry>>(cacheFile.readText())
                 cacheMap.putAll(loaded)
             } catch (e: Exception) {
                 Log.w(tag, "Failed to load cache index: ${e.message}")
@@ -68,7 +73,7 @@ class MirrorEngine(
 
     private fun saveCache() {
         try {
-            cacheFile.writeText(Json.encodeToString(cacheMap))
+            cacheFile.writeText(json.encodeToString(cacheMap))
         } catch (e: Exception) {
             Log.w(tag, "Failed to save cache index: ${e.message}")
         }
@@ -120,7 +125,7 @@ class MirrorEngine(
         force: Boolean = false,
     ) {
         val now = System.currentTimeMillis()
-        if (force || recentFailure != null || now - lastProgressReportTime >= 50) {
+        if (force || recentFailure != null || (now - lastProgressReportTime >= 150)) {
             lastProgressReportTime = now
             onProgress(
                 MirrorProgress(
@@ -154,142 +159,139 @@ class MirrorEngine(
         val cachedEntry = downloadMutex.withLock { cacheMap[normalizedUrl] }
 
         try {
-            val response = semaphore.withPermit {
-                fetchUrl(normalizedUrl, cachedEntry, localFile.exists())
+            var nextUrlsToProcess: List<String> = emptyList()
+
+            concurrencySemaphore.withPermit {
+                val response = fetchUrl(normalizedUrl, cachedEntry, localFile.exists(), host)
+                when (response) {
+                    is FetchResult.Failure -> {
+                        downloadMutex.withLock {
+                            failures[normalizedUrl] = response.error
+                            notifyProgressLocked(
+                                currentUrl = normalizedUrl,
+                                recentFailure = normalizedUrl to response.error,
+                                force = true,
+                            )
+                        }
+                        return@withPermit
+                    }
+
+                    is FetchResult.NotModified -> {
+                        val contentType = response.contentType ?: cachedEntry?.contentType ?: ""
+                        val effectiveUrl = response.finalUrl
+                        val effectiveNormalizedUrl = normalizeUrl(effectiveUrl)
+                        val effectiveLocalFile = getLocalFile(effectiveNormalizedUrl, host)
+
+                        downloadMutex.withLock {
+                            unchangedCount++
+                            if (depth == 0) {
+                                entryPath = computeEntryPath(effectiveLocalFile)
+                            }
+                            notifyProgressLocked(currentUrl = effectiveNormalizedUrl)
+                        }
+
+                        if (cachedEntry != null && cachedEntry.children.isNotEmpty()) {
+                            // Use stored original URLs from cache instead of re-parsing remapped local file
+                            nextUrlsToProcess = cachedEntry.children
+                        } else {
+                            // Fallback if cache is missing children info
+                            if (contentType.contains(
+                                    "text/html",
+                                    ignoreCase = true
+                                ) && effectiveLocalFile.exists()
+                            ) {
+                                val doc =
+                                    Jsoup.parse(effectiveLocalFile, "UTF-8", effectiveNormalizedUrl)
+                                nextUrlsToProcess =
+                                    remapAndCollect(doc, effectiveNormalizedUrl, host)
+                            } else if (contentType.contains(
+                                    "text/css",
+                                    ignoreCase = true
+                                ) && effectiveLocalFile.exists()
+                            ) {
+                                val css = effectiveLocalFile.readText()
+                                val (remappedCss, nextUrls) = remapAndCollectCss(
+                                    css,
+                                    effectiveNormalizedUrl,
+                                    host
+                                )
+                                effectiveLocalFile.writeText(remappedCss)
+                                nextUrlsToProcess = nextUrls
+                            }
+                        }
+                    }
+
+                    is FetchResult.Success -> {
+                        val contentType = response.contentType ?: ""
+                        val effectiveUrl = response.finalUrl
+                        val effectiveNormalizedUrl = normalizeUrl(effectiveUrl)
+                        val effectiveLocalFile = getLocalFile(effectiveNormalizedUrl, host)
+
+                        effectiveLocalFile.parentFile?.mkdirs()
+
+                        var nextUrls: List<String> = emptyList()
+
+                        if (contentType.contains("text/html", ignoreCase = true)) {
+                            val doc = if (response.inMemoryText != null) {
+                                Jsoup.parse(response.inMemoryText, effectiveNormalizedUrl)
+                            } else {
+                                Jsoup.parse(effectiveLocalFile, "UTF-8", effectiveNormalizedUrl)
+                            }
+
+                            // Remap links and gather new URLs to download
+                            nextUrls = remapAndCollect(doc, effectiveNormalizedUrl, host)
+
+                            // Write remapped HTML
+                            effectiveLocalFile.writeText(doc.outerHtml())
+
+                            // If the URL was redirected (e.g. /docs -> /docs/index.html),
+                            // also write a redirect helper at the alias location so links to /docs work
+                            if (effectiveLocalFile.canonicalPath != localFile.canonicalPath) {
+                                try {
+                                    localFile.parentFile?.mkdirs()
+                                    val relToTarget = getRelativePath(localFile, effectiveLocalFile)
+                                    localFile.writeText("<!DOCTYPE html><html><head><meta http-equiv=\"refresh\" content=\"0;url=$relToTarget\"></head><body></body></html>")
+                                } catch (_: Exception) {
+                                    // Ignore alias write failure
+                                }
+                            }
+                        } else if (contentType.contains("text/css", ignoreCase = true)) {
+                            val css = response.inMemoryText ?: effectiveLocalFile.readText()
+                            val (remappedCss, urls) = remapAndCollectCss(
+                                css,
+                                effectiveNormalizedUrl,
+                                host
+                            )
+                            effectiveLocalFile.writeText(remappedCss)
+                            nextUrls = urls
+                        }
+
+                        downloadMutex.withLock {
+                            if (effectiveNormalizedUrl != normalizedUrl) {
+                                visitedUrls.add(effectiveNormalizedUrl)
+                            }
+                            if (depth == 0) {
+                                entryPath = computeEntryPath(effectiveLocalFile)
+                            }
+                            cacheMap[effectiveNormalizedUrl] = CacheEntry(
+                                etag = response.etag,
+                                lastModified = response.lastModified,
+                                contentType = contentType,
+                                children = nextUrls
+                            )
+                            downloadedCount++
+                            notifyProgressLocked(currentUrl = effectiveNormalizedUrl)
+                        }
+                        nextUrlsToProcess = nextUrls
+                    }
+                }
             }
-            when (response) {
-                is FetchResult.Failure -> {
-                    downloadMutex.withLock {
-                        failures[normalizedUrl] = response.error
-                        notifyProgressLocked(
-                            currentUrl = normalizedUrl,
-                            recentFailure = normalizedUrl to response.error,
-                            force = true,
-                        )
-                    }
-                    return
-                }
 
-                is FetchResult.NotModified -> {
-                    val contentType = response.contentType ?: cachedEntry?.contentType ?: ""
-                    val effectiveUrl = response.finalUrl
-                    val effectiveNormalizedUrl = normalizeUrl(effectiveUrl)
-                    val effectiveLocalFile = getLocalFile(effectiveNormalizedUrl, host)
-
-                    downloadMutex.withLock {
-                        unchangedCount++
-                        if (depth == 0) {
-                            entryPath = computeEntryPath(effectiveLocalFile)
-                        }
-                        notifyProgressLocked(currentUrl = effectiveNormalizedUrl)
-                    }
-
-                    if (contentType.contains("text/html") && effectiveLocalFile.exists()) {
-                        val doc = Jsoup.parse(effectiveLocalFile.readText(), effectiveNormalizedUrl)
-                        val nextUrls = remapAndCollect(doc, effectiveNormalizedUrl, host)
-                        coroutineScope {
-                            nextUrls.forEach { nextUrl ->
-                                launch {
-                                    downloadRecursive(nextUrl, host, depth + 1, maxDepth)
-                                }
-                            }
-                        }
-                    } else if (contentType.contains("text/css") && effectiveLocalFile.exists()) {
-                        val css = effectiveLocalFile.readText()
-                        val (remappedCss, nextUrls) = remapAndCollectCss(css, effectiveNormalizedUrl, host)
-                        effectiveLocalFile.writeText(remappedCss)
-                        coroutineScope {
-                            nextUrls.forEach { nextUrl ->
-                                launch {
-                                    downloadRecursive(nextUrl, host, depth + 1, maxDepth)
-                                }
-                            }
-                        }
-                    }
-                }
-
-                is FetchResult.Success -> {
-                    val contentType = response.contentType ?: ""
-                    val bodyBytes = response.bytes
-                    val effectiveUrl = response.finalUrl
-                    val effectiveNormalizedUrl = normalizeUrl(effectiveUrl)
-                    val effectiveLocalFile = getLocalFile(effectiveNormalizedUrl, host)
-
-                    effectiveLocalFile.parentFile?.mkdirs()
-
-                    downloadMutex.withLock {
-                        if (effectiveNormalizedUrl != normalizedUrl) {
-                            visitedUrls.add(effectiveNormalizedUrl)
-                        }
-                        if (depth == 0) {
-                            entryPath = computeEntryPath(effectiveLocalFile)
-                        }
-                        cacheMap[effectiveNormalizedUrl] = CacheEntry(
-                            etag = response.etag,
-                            lastModified = response.lastModified,
-                            contentType = contentType,
-                        )
-                    }
-
-                    if (contentType.contains("text/html")) {
-                        val html = String(bodyBytes)
-                        val doc = Jsoup.parse(html, effectiveNormalizedUrl)
-                        
-                        // Remap links and gather new URLs to download
-                        val nextUrls = remapAndCollect(doc, effectiveNormalizedUrl, host)
-                        
-                        // Write remapped HTML
-                        effectiveLocalFile.writeText(doc.outerHtml())
-
-                        // If the URL was redirected (e.g. /docs -> /docs/index.html),
-                        // also write a redirect helper at the alias location so links to /docs work
-                        if (effectiveLocalFile.canonicalPath != localFile.canonicalPath) {
-                            try {
-                                localFile.parentFile?.mkdirs()
-                                val relToTarget = getRelativePath(localFile, effectiveLocalFile)
-                                localFile.writeText("<!DOCTYPE html><html><head><meta http-equiv=\"refresh\" content=\"0;url=$relToTarget\"></head><body></body></html>")
-                            } catch (_: Exception) {
-                                // Ignore alias write failure
-                            }
-                        }
-                        
-                        downloadMutex.withLock {
-                            downloadedCount++
-                            notifyProgressLocked(currentUrl = effectiveNormalizedUrl)
-                        }
-
-                        // Recursively download next URLs
-                        coroutineScope {
-                            nextUrls.forEach { nextUrl ->
-                                launch {
-                                    downloadRecursive(nextUrl, host, depth + 1, maxDepth)
-                                }
-                            }
-                        }
-                    } else if (contentType.contains("text/css")) {
-                        val css = String(bodyBytes)
-                        val (remappedCss, nextUrls) = remapAndCollectCss(css, effectiveNormalizedUrl, host)
-                        effectiveLocalFile.writeText(remappedCss)
-
-                        downloadMutex.withLock {
-                            downloadedCount++
-                            notifyProgressLocked(currentUrl = effectiveNormalizedUrl)
-                        }
-
-                        coroutineScope {
-                            nextUrls.forEach { nextUrl ->
-                                launch {
-                                    downloadRecursive(nextUrl, host, depth + 1, maxDepth)
-                                }
-                            }
-                        }
-                    } else {
-                        // For images, fonts, binaries, etc.
-                        effectiveLocalFile.writeBytes(bodyBytes)
-                        
-                        downloadMutex.withLock {
-                            downloadedCount++
-                            notifyProgressLocked(currentUrl = effectiveNormalizedUrl)
+            if (nextUrlsToProcess.isNotEmpty()) {
+                coroutineScope {
+                    nextUrlsToProcess.forEach { nextUrl ->
+                        launch {
+                            downloadRecursive(nextUrl, host, depth + 1, maxDepth)
                         }
                     }
                 }
@@ -349,6 +351,7 @@ class MirrorEngine(
         url: String,
         cachedEntry: CacheEntry?,
         localFileExists: Boolean,
+        host: String,
     ): FetchResult = withContext(Dispatchers.IO) {
         val requestBuilder = Request.Builder().url(url)
         if (localFileExists && cachedEntry != null) {
@@ -369,8 +372,26 @@ class MirrorEngine(
                     return@withContext FetchResult.Failure("HTTP ${response.code}: ${response.message}")
                 }
                 val body = response.body
+                val contentType = response.header("Content-Type") ?: ""
+                val isTextAsset = contentType.contains("text/html", ignoreCase = true) ||
+                        contentType.contains("text/css", ignoreCase = true)
+
+                val inMemoryText = if (isTextAsset) {
+                    body.string()
+                } else {
+                    val effectiveNormalizedUrl = normalizeUrl(finalUrl)
+                    val effectiveLocalFile = getLocalFile(effectiveNormalizedUrl, host)
+                    effectiveLocalFile.parentFile?.mkdirs()
+                    body.byteStream().use { input ->
+                        effectiveLocalFile.outputStream().use { output ->
+                            input.copyTo(output)
+                        }
+                    }
+                    null
+                }
+
                 FetchResult.Success(
-                    bytes = body.bytes(),
+                    inMemoryText = inMemoryText,
                     contentType = response.header("Content-Type"),
                     etag = response.header("ETag"),
                     lastModified = response.header("Last-Modified"),
@@ -479,7 +500,7 @@ class MirrorEngine(
 
     private sealed interface FetchResult {
         class Success(
-            val bytes: ByteArray,
+            val inMemoryText: String?,
             val contentType: String?,
             val etag: String?,
             val lastModified: String?,
