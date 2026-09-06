@@ -123,8 +123,7 @@ class MirrorEngine(
         val cachedEntry = downloadMutex.withLock { cacheMap[normalizedUrl] }
 
         try {
-            val response = fetchUrl(normalizedUrl, cachedEntry, localFile.exists())
-            when (response) {
+            when (val response = fetchUrl(normalizedUrl, cachedEntry, localFile.exists())) {
                 is FetchResult.Failure -> {
                     downloadMutex.withLock {
                         failures[normalizedUrl] = response.error

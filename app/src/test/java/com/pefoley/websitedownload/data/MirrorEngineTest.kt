@@ -366,7 +366,7 @@ class MirrorEngineTest {
                 .setBody("""
                     <html>
                         <head>
-                            <base href="${server.url("/docs/").toString()}">
+                            <base href="${server.url("/docs/")}">
                             <link rel="stylesheet" href="style.css">
                         </head>
                         <body>
