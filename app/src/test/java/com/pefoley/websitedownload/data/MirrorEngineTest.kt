@@ -398,5 +398,51 @@ class MirrorEngineTest {
         assertTrue("On-page anchor #section should remain #section", htmlContent.contains("href=\"#section\""))
         assertTrue("Base tag should be removed so local relative paths work offline", !htmlContent.contains("<base"))
     }
+
+    @Test
+    fun `test concurrent downloads do not perform duplicate work`() = runBlocking {
+        val baseUrl = server.url("/").toString()
+
+        // Page 1 and Page 2 both reference shared.css and each other
+        server.enqueue(
+            MockResponse()
+                .setBody("""
+                    <html>
+                        <head><link rel="stylesheet" href="shared.css"></head>
+                        <body>
+                            <a href="page2.html">Page 2</a>
+                        </body>
+                    </html>
+                """.trimIndent())
+                .setHeader("Content-Type", "text/html")
+        )
+
+        // shared.css (slow response to test concurrency window)
+        server.enqueue(
+            MockResponse()
+                .setBody("body { margin: 0; }")
+                .setHeader("Content-Type", "text/css")
+        )
+
+        // page2.html
+        server.enqueue(
+            MockResponse()
+                .setBody("""
+                    <html>
+                        <head><link rel="stylesheet" href="shared.css"></head>
+                        <body>Page 2</body>
+                    </html>
+                """.trimIndent())
+                .setHeader("Content-Type", "text/html")
+        )
+
+        val success = engine.mirror(baseUrl, maxDepth = 2)
+        assertTrue(success)
+
+        val recordedRequests = (1..server.requestCount).map { server.takeRequest().path }
+        val sharedCssRequests = recordedRequests.filter { it == "/shared.css" }
+        Assert.assertEquals("shared.css should only be requested once despite multiple references", 1, sharedCssRequests.size)
+    }
 }
+
 

@@ -2,8 +2,12 @@ package com.pefoley.websitedownload.data
 
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -33,6 +37,7 @@ data class MirrorProgress(
 class MirrorEngine(
     private val client: OkHttpClient,
     private val rootDir: File,
+    maxConcurrency: Int = 8,
     private val onProgress: (progress: MirrorProgress) -> Unit = {},
 ) {
     private val tag = "MirrorEngine"
@@ -40,8 +45,10 @@ class MirrorEngine(
     private val failures = mutableMapOf<String, String>()
     private val cacheMap = mutableMapOf<String, CacheEntry>()
     private val downloadMutex = Mutex()
+    private val semaphore = Semaphore(maxConcurrency)
     private var downloadedCount = 0
     private var unchangedCount = 0
+    private var lastProgressReportTime = 0L
     private val cacheFile = File(rootDir, "cache_index.json")
 
     init {
@@ -86,15 +93,10 @@ class MirrorEngine(
             Log.e(tag, error)
             downloadMutex.withLock {
                 failures[startUrl] = error
-                onProgress(
-                    MirrorProgress(
-                        downloadedCount = downloadedCount,
-                        unchangedCount = unchangedCount,
-                        failedCount = failures.size,
-                        currentUrl = startUrl,
-                        recentFailure = startUrl to error,
-                        failedUrls = failures.toMap(),
-                    )
+                notifyProgressLocked(
+                    currentUrl = startUrl,
+                    recentFailure = startUrl to error,
+                    force = true,
                 )
             }
             return@withContext false
@@ -102,11 +104,35 @@ class MirrorEngine(
         val host = httpUrl.host
         
         downloadRecursive(httpUrl.toString(), host, 0, maxDepth)
-        val success = downloadMutex.withLock { (downloadedCount + unchangedCount) > 0 }
+        val success = downloadMutex.withLock {
+            notifyProgressLocked(currentUrl = "", force = true)
+            (downloadedCount + unchangedCount) > 0
+        }
         if (success) {
             saveCache()
         }
         success
+    }
+
+    private fun notifyProgressLocked(
+        currentUrl: String,
+        recentFailure: Pair<String, String>? = null,
+        force: Boolean = false,
+    ) {
+        val now = System.currentTimeMillis()
+        if (force || recentFailure != null || now - lastProgressReportTime >= 50) {
+            lastProgressReportTime = now
+            onProgress(
+                MirrorProgress(
+                    downloadedCount = downloadedCount,
+                    unchangedCount = unchangedCount,
+                    failedCount = failures.size,
+                    currentUrl = currentUrl,
+                    recentFailure = recentFailure,
+                    failedUrls = failures.toMap(),
+                )
+            )
+        }
     }
 
     private suspend fun downloadRecursive(url: String, host: String, depth: Int, maxDepth: Int) {
@@ -114,28 +140,31 @@ class MirrorEngine(
         
         val normalizedUrl = normalizeUrl(url)
         
-        downloadMutex.withLock {
-            if (visitedUrls.contains(normalizedUrl)) return
-            visitedUrls.add(normalizedUrl)
+        val isNew = downloadMutex.withLock {
+            if (visitedUrls.contains(normalizedUrl)) {
+                false
+            } else {
+                visitedUrls.add(normalizedUrl)
+                true
+            }
         }
+        if (!isNew) return
 
         val localFile = getLocalFile(normalizedUrl, host)
         val cachedEntry = downloadMutex.withLock { cacheMap[normalizedUrl] }
 
         try {
-            when (val response = fetchUrl(normalizedUrl, cachedEntry, localFile.exists())) {
+            val response = semaphore.withPermit {
+                fetchUrl(normalizedUrl, cachedEntry, localFile.exists())
+            }
+            when (response) {
                 is FetchResult.Failure -> {
                     downloadMutex.withLock {
                         failures[normalizedUrl] = response.error
-                        onProgress(
-                            MirrorProgress(
-                                downloadedCount = downloadedCount,
-                                unchangedCount = unchangedCount,
-                                failedCount = failures.size,
-                                currentUrl = normalizedUrl,
-                                recentFailure = normalizedUrl to response.error,
-                                failedUrls = failures.toMap(),
-                            )
+                        notifyProgressLocked(
+                            currentUrl = normalizedUrl,
+                            recentFailure = normalizedUrl to response.error,
+                            force = true,
                         )
                     }
                     return
@@ -152,29 +181,29 @@ class MirrorEngine(
                         if (depth == 0) {
                             entryPath = computeEntryPath(effectiveLocalFile)
                         }
-                        onProgress(
-                            MirrorProgress(
-                                downloadedCount = downloadedCount,
-                                unchangedCount = unchangedCount,
-                                failedCount = failures.size,
-                                currentUrl = effectiveNormalizedUrl,
-                                failedUrls = failures.toMap(),
-                            )
-                        )
+                        notifyProgressLocked(currentUrl = effectiveNormalizedUrl)
                     }
 
                     if (contentType.contains("text/html") && effectiveLocalFile.exists()) {
                         val doc = Jsoup.parse(effectiveLocalFile.readText(), effectiveNormalizedUrl)
                         val nextUrls = remapAndCollect(doc, effectiveNormalizedUrl, host)
-                        nextUrls.forEach { nextUrl ->
-                            downloadRecursive(nextUrl, host, depth + 1, maxDepth)
+                        coroutineScope {
+                            nextUrls.forEach { nextUrl ->
+                                launch {
+                                    downloadRecursive(nextUrl, host, depth + 1, maxDepth)
+                                }
+                            }
                         }
                     } else if (contentType.contains("text/css") && effectiveLocalFile.exists()) {
                         val css = effectiveLocalFile.readText()
                         val (remappedCss, nextUrls) = remapAndCollectCss(css, effectiveNormalizedUrl, host)
                         effectiveLocalFile.writeText(remappedCss)
-                        nextUrls.forEach { nextUrl ->
-                            downloadRecursive(nextUrl, host, depth + 1, maxDepth)
+                        coroutineScope {
+                            nextUrls.forEach { nextUrl ->
+                                launch {
+                                    downloadRecursive(nextUrl, host, depth + 1, maxDepth)
+                                }
+                            }
                         }
                     }
                 }
@@ -226,20 +255,16 @@ class MirrorEngine(
                         
                         downloadMutex.withLock {
                             downloadedCount++
-                            onProgress(
-                                MirrorProgress(
-                                    downloadedCount = downloadedCount,
-                                    unchangedCount = unchangedCount,
-                                    failedCount = failures.size,
-                                    currentUrl = effectiveNormalizedUrl,
-                                    failedUrls = failures.toMap(),
-                                )
-                            )
+                            notifyProgressLocked(currentUrl = effectiveNormalizedUrl)
                         }
 
                         // Recursively download next URLs
-                        nextUrls.forEach { nextUrl ->
-                            downloadRecursive(nextUrl, host, depth + 1, maxDepth)
+                        coroutineScope {
+                            nextUrls.forEach { nextUrl ->
+                                launch {
+                                    downloadRecursive(nextUrl, host, depth + 1, maxDepth)
+                                }
+                            }
                         }
                     } else if (contentType.contains("text/css")) {
                         val css = String(bodyBytes)
@@ -248,19 +273,15 @@ class MirrorEngine(
 
                         downloadMutex.withLock {
                             downloadedCount++
-                            onProgress(
-                                MirrorProgress(
-                                    downloadedCount = downloadedCount,
-                                    unchangedCount = unchangedCount,
-                                    failedCount = failures.size,
-                                    currentUrl = effectiveNormalizedUrl,
-                                    failedUrls = failures.toMap(),
-                                )
-                            )
+                            notifyProgressLocked(currentUrl = effectiveNormalizedUrl)
                         }
 
-                        nextUrls.forEach { nextUrl ->
-                            downloadRecursive(nextUrl, host, depth + 1, maxDepth)
+                        coroutineScope {
+                            nextUrls.forEach { nextUrl ->
+                                launch {
+                                    downloadRecursive(nextUrl, host, depth + 1, maxDepth)
+                                }
+                            }
                         }
                     } else {
                         // For images, fonts, binaries, etc.
@@ -268,15 +289,7 @@ class MirrorEngine(
                         
                         downloadMutex.withLock {
                             downloadedCount++
-                            onProgress(
-                                MirrorProgress(
-                                    downloadedCount = downloadedCount,
-                                    unchangedCount = unchangedCount,
-                                    failedCount = failures.size,
-                                    currentUrl = effectiveNormalizedUrl,
-                                    failedUrls = failures.toMap(),
-                                )
-                            )
+                            notifyProgressLocked(currentUrl = effectiveNormalizedUrl)
                         }
                     }
                 }
@@ -286,15 +299,10 @@ class MirrorEngine(
             val errorMsg = e.message ?: "Unknown error"
             downloadMutex.withLock {
                 failures[normalizedUrl] = errorMsg
-                onProgress(
-                    MirrorProgress(
-                        downloadedCount = downloadedCount,
-                        unchangedCount = unchangedCount,
-                        failedCount = failures.size,
-                        currentUrl = normalizedUrl,
-                        recentFailure = normalizedUrl to errorMsg,
-                        failedUrls = failures.toMap(),
-                    )
+                notifyProgressLocked(
+                    currentUrl = normalizedUrl,
+                    recentFailure = normalizedUrl to errorMsg,
+                    force = true,
                 )
             }
         }
@@ -438,14 +446,15 @@ class MirrorEngine(
             }
         }
 
-        remap("a[href]", "href", isNavigationLink = true)
-        remap("img[src]", "src", isNavigationLink = false)
+        // Assets (img, stylesheet, script) should be processed before links to keep resource downloads predictable
         remap("link[href]", "href", isNavigationLink = false)
         remap("script[src]", "src", isNavigationLink = false)
+        remap("img[src]", "src", isNavigationLink = false)
         remap("source[src]", "src", isNavigationLink = false)
         remap("video[src]", "src", isNavigationLink = false)
         remap("audio[src]", "src", isNavigationLink = false)
         remap("iframe[src]", "src", isNavigationLink = false)
+        remap("a[href]", "href", isNavigationLink = true)
 
         return nextUrls
     }
