@@ -12,6 +12,7 @@ import kotlinx.coroutines.launch
 import kotlinx.parcelize.Parcelize
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import java.io.File
 
@@ -21,7 +22,9 @@ data class MirrorState(
     val currentDownloadUrl: String = "",
     val downloadedCount: Int = 0,
     val unchangedCount: Int = 0,
+    val failedCount: Int = 0,
     val activeMirrorId: String? = null,
+    val inProgressFailures: Map<String, String> = emptyMap(),
     val error: String? = null,
 )
 
@@ -34,6 +37,7 @@ data class MirrorItem(
     val fileCount: Int = 0,
     val failureCount: Int = 0,
     val lastRefreshedAt: Long = 0L,
+    val entryPath: String = "index.html",
 ) : Parcelable
 
 class MirrorViewModel(application: Application) : AndroidViewModel(application) {
@@ -80,12 +84,31 @@ class MirrorViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun fallbackMirrorItem(dir: File): MirrorItem {
+        val entry = findDefaultEntryFile(dir)
         return MirrorItem(
             id = dir.name,
             url = dir.name.replace("___", "://").replace("_", "/"),
             rootPath = dir.absolutePath,
             fileCount = countMirrorFiles(dir),
+            entryPath = entry,
         )
+    }
+
+    private fun findDefaultEntryFile(dir: File): String {
+        val metadataFile = File(dir, "metadata.json")
+        if (metadataFile.exists()) {
+            try {
+                val metadata = Json.decodeFromString<MirrorItem>(metadataFile.readText())
+                if (metadata.entryPath.isNotBlank() && File(dir, metadata.entryPath).exists()) {
+                    return metadata.entryPath
+                }
+            } catch (_: Exception) {
+                // Ignore metadata parse failure
+            }
+        }
+        if (File(dir, "index.html").exists()) return "index.html"
+        val htmlFile = dir.walkTopDown().firstOrNull { it.isFile && it.extension.equals("html", ignoreCase = true) }
+        return htmlFile?.relativeTo(dir)?.path?.replace('\\', '/') ?: "index.html"
     }
 
     fun deleteMirror(mirrorId: String) {
@@ -120,12 +143,22 @@ class MirrorViewModel(application: Application) : AndroidViewModel(application) 
                 error = null,
                 downloadedCount = 0,
                 unchangedCount = 0,
+                failedCount = 0,
+                inProgressFailures = emptyMap(),
                 activeMirrorId = mirrorId,
             )
             val targetDir = File(mirrorsDir, mirrorId)
             
             if (!targetDir.exists()) {
                 targetDir.mkdirs()
+            }
+
+            val dummyEngine = MirrorEngine(client, targetDir)
+            val localStartFile = dummyEngine.getLocalFile(url)
+            val relativeEntryPath = try {
+                localStartFile.relativeTo(targetDir).path.replace('\\', '/')
+            } catch (_: Exception) {
+                "index.html"
             }
             
             // Save metadata
@@ -134,6 +167,7 @@ class MirrorViewModel(application: Application) : AndroidViewModel(application) 
                 url = url,
                 rootPath = targetDir.absolutePath,
                 lastRefreshedAt = System.currentTimeMillis(),
+                entryPath = relativeEntryPath,
             )
             try {
                 File(targetDir, "metadata.json").writeText(Json.encodeToString(item))
@@ -145,7 +179,15 @@ class MirrorViewModel(application: Application) : AndroidViewModel(application) 
                 _uiState.value = _uiState.value.copy(
                     downloadedCount = progress.downloadedCount,
                     unchangedCount = progress.unchangedCount,
+                    failedCount = progress.failedCount,
                     currentDownloadUrl = progress.currentUrl,
+                    inProgressFailures = if (progress.failedUrls.isNotEmpty()) {
+                        progress.failedUrls
+                    } else if (progress.recentFailure != null) {
+                        _uiState.value.inProgressFailures + progress.recentFailure
+                    } else {
+                        _uiState.value.inProgressFailures
+                    },
                 )
             }
 
@@ -154,17 +196,29 @@ class MirrorViewModel(application: Application) : AndroidViewModel(application) 
                 val success = engine.mirror(url)
                 val finalCount = countMirrorFiles(targetDir)
                 val failures = engine.failedUrls
+                val normalizedStartUrl = url.toHttpUrlOrNull()?.newBuilder()?.fragment(null)?.build()?.toString() ?: url
 
                 if (!success || (finalCount == 0)) {
                     targetDir.deleteRecursively()
-                    val errorMessage = failures[url] ?: "Could not download site. The URL may be invalid or unreachable."
-                    _uiState.value = _uiState.value.copy(error = errorMessage)
+                    val actualError = failures[url]
+                        ?: failures[normalizedStartUrl]
+                        ?: failures.values.firstOrNull()
+                        ?: "Could not download site. The URL may be invalid or unreachable."
+                    _uiState.value = _uiState.value.copy(error = actualError)
                 } else {
                     mirrorCreated = true
+                    val verifiedEntryPath = if (engine.entryPath.isNotBlank() && File(targetDir, engine.entryPath).exists()) {
+                        engine.entryPath
+                    } else if (File(targetDir, relativeEntryPath).exists()) {
+                        relativeEntryPath
+                    } else {
+                        findDefaultEntryFile(targetDir)
+                    }
                     val updatedItem = item.copy(
                         fileCount = finalCount,
                         failureCount = failures.size,
                         lastRefreshedAt = System.currentTimeMillis(),
+                        entryPath = verifiedEntryPath,
                     )
                     try {
                         File(targetDir, "metadata.json").writeText(Json.encodeToString(updatedItem))
@@ -199,6 +253,8 @@ class MirrorViewModel(application: Application) : AndroidViewModel(application) 
                 error = null,
                 downloadedCount = 0,
                 unchangedCount = 0,
+                failedCount = 0,
+                inProgressFailures = emptyMap(),
                 activeMirrorId = mirrorId,
             )
 
@@ -206,7 +262,15 @@ class MirrorViewModel(application: Application) : AndroidViewModel(application) 
                 _uiState.value = _uiState.value.copy(
                     downloadedCount = progress.downloadedCount,
                     unchangedCount = progress.unchangedCount,
+                    failedCount = progress.failedCount,
                     currentDownloadUrl = progress.currentUrl,
+                    inProgressFailures = if (progress.failedUrls.isNotEmpty()) {
+                        progress.failedUrls
+                    } else if (progress.recentFailure != null) {
+                        _uiState.value.inProgressFailures + progress.recentFailure
+                    } else {
+                        _uiState.value.inProgressFailures
+                    },
                 )
             }
 
@@ -216,10 +280,18 @@ class MirrorViewModel(application: Application) : AndroidViewModel(application) 
                 val failures = engine.failedUrls
 
                 if (success) {
+                    val verifiedEntryPath = if (engine.entryPath.isNotBlank() && File(targetDir, engine.entryPath).exists()) {
+                        engine.entryPath
+                    } else if (File(targetDir, existingItem.entryPath).exists()) {
+                        existingItem.entryPath
+                    } else {
+                        findDefaultEntryFile(targetDir)
+                    }
                     val updatedItem = existingItem.copy(
                         fileCount = finalCount,
                         failureCount = failures.size,
                         lastRefreshedAt = System.currentTimeMillis(),
+                        entryPath = verifiedEntryPath,
                     )
                     try {
                         File(targetDir, "metadata.json").writeText(Json.encodeToString(updatedItem))
@@ -230,7 +302,12 @@ class MirrorViewModel(application: Application) : AndroidViewModel(application) 
                     loadMirrors()
                     onSuccess()
                 } else {
-                    _uiState.value = _uiState.value.copy(error = "Refresh failed: could not reach host")
+                    val normalizedExistingUrl = existingItem.url.toHttpUrlOrNull()?.newBuilder()?.fragment(null)?.build()?.toString() ?: existingItem.url
+                    val actualError = failures[existingItem.url]
+                        ?: failures[normalizedExistingUrl]
+                        ?: failures.values.firstOrNull()
+                        ?: "Refresh failed: could not reach host"
+                    _uiState.value = _uiState.value.copy(error = actualError)
                 }
             } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(error = e.message ?: "Refresh failed")

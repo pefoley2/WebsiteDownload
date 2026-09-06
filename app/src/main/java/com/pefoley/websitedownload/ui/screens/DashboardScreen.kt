@@ -100,6 +100,8 @@ fun DashboardScreen(
                     currentDownloadUrl = uiState.currentDownloadUrl,
                     downloadedCount = uiState.downloadedCount,
                     unchangedCount = uiState.unchangedCount,
+                    failedCount = uiState.failedCount,
+                    inProgressFailures = uiState.inProgressFailures,
                     error = uiState.error,
                     onStartMirror = { url ->
                         viewModel.startMirror(url) { newMirrorId ->
@@ -178,6 +180,8 @@ private fun DetailPaneContent(
     currentDownloadUrl: String,
     downloadedCount: Int,
     unchangedCount: Int,
+    failedCount: Int = 0,
+    inProgressFailures: Map<String, String> = emptyMap(),
     error: String?,
     onStartMirror: (String) -> Unit,
     onRefreshMirror: (String) -> Unit,
@@ -222,6 +226,8 @@ private fun DetailPaneContent(
                     isDownloading = isDownloading,
                     currentDownloadUrl = currentDownloadUrl,
                     downloadedCount = downloadedCount,
+                    failedCount = failedCount,
+                    inProgressFailures = inProgressFailures,
                     error = error,
                     onStartMirror = onStartMirror,
                 )
@@ -233,6 +239,8 @@ private fun DetailPaneContent(
                     currentDownloadUrl = currentDownloadUrl,
                     downloadedCount = downloadedCount,
                     unchangedCount = unchangedCount,
+                    failedCount = if (isCurrentMirrorDownloading) failedCount else selectedItem.failureCount,
+                    inProgressFailures = if (isCurrentMirrorDownloading) inProgressFailures else emptyMap(),
                     onRefreshMirror = { onRefreshMirror(selectedItem.id) },
                     onOpenMirror = onOpenMirror,
                     onDeleteMirror = onDeleteMirror,
@@ -248,6 +256,8 @@ private fun URLInputSection(
     isDownloading: Boolean,
     currentDownloadUrl: String,
     downloadedCount: Int,
+    failedCount: Int = 0,
+    inProgressFailures: Map<String, String> = emptyMap(),
     error: String?,
     onStartMirror: (String) -> Unit,
 ) {
@@ -255,6 +265,7 @@ private fun URLInputSection(
         val initialText = "https://"
         mutableStateOf(TextFieldValue(initialText, TextRange(initialText.length)))
     }
+    var showInProgressFailures by remember { mutableStateOf(false) }
 
     OutlinedTextField(
         value = urlValue,
@@ -284,13 +295,72 @@ private fun URLInputSection(
 
     if (isDownloading) {
         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-        Text("Downloading: $downloadedCount files")
+        val statusText = buildString {
+            append("Downloading: $downloadedCount files")
+            if (failedCount > 0) {
+                append(" ($failedCount failed)")
+            }
+        }
+        Text(statusText)
+        if (failedCount > 0 && inProgressFailures.isNotEmpty()) {
+            TextButton(
+                onClick = { showInProgressFailures = true },
+                contentPadding = PaddingValues(0.dp),
+            ) {
+                Text(
+                    "View in-progress failures ($failedCount)",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
         Text(
             currentDownloadUrl,
             style = MaterialTheme.typography.bodySmall,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
+
+        if (showInProgressFailures) {
+            AlertDialog(
+                onDismissRequest = { showInProgressFailures = false },
+                title = { Text("Failures in Progress ($failedCount)") },
+                text = {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 350.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        items(inProgressFailures.toList()) { (fUrl, fError) ->
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 4.dp),
+                            ) {
+                                Text(
+                                    text = fUrl,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                )
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = fError,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error,
+                                )
+                            }
+                            HorizontalDivider()
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { showInProgressFailures = false }) {
+                        Text("Close")
+                    }
+                },
+            )
+        }
     } else {
         Button(
             onClick = { onStartMirror(urlValue.text) },
@@ -308,6 +378,8 @@ private fun MirrorInfoSection(
     currentDownloadUrl: String = "",
     downloadedCount: Int = 0,
     unchangedCount: Int = 0,
+    failedCount: Int = item.failureCount,
+    inProgressFailures: Map<String, String> = emptyMap(),
     onRefreshMirror: () -> Unit = {},
     onOpenMirror: (MirrorItem) -> Unit,
     onDeleteMirror: (MirrorItem) -> Unit,
@@ -315,6 +387,7 @@ private fun MirrorInfoSection(
 ) {
     var showDeleteConfirmDialog by remember { mutableStateOf(value = false) }
     var showFailuresDialog by remember { mutableStateOf(value = false) }
+    var showInProgressFailuresDialog by remember { mutableStateOf(value = false) }
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -330,7 +403,7 @@ private fun MirrorInfoSection(
                 }
                 Text("Last refreshed: $formattedDate", style = MaterialTheme.typography.bodySmall)
             }
-            if (item.failureCount > 0) {
+            if (!isRefreshing && item.failureCount > 0) {
                 Spacer(modifier = Modifier.height(4.dp))
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -357,12 +430,29 @@ private fun MirrorInfoSection(
 
     if (isRefreshing) {
         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-        val progressText = if (unchangedCount > 0) {
-            "Refreshing: $downloadedCount updated, $unchangedCount unchanged"
-        } else {
-            "Refreshing: $downloadedCount files"
+        val progressText = buildString {
+            if (unchangedCount > 0) {
+                append("Refreshing: $downloadedCount updated, $unchangedCount unchanged")
+            } else {
+                append("Refreshing: $downloadedCount files")
+            }
+            if (failedCount > 0) {
+                append(" ($failedCount failed)")
+            }
         }
         Text(progressText, style = MaterialTheme.typography.bodyMedium)
+        if (failedCount > 0 && inProgressFailures.isNotEmpty()) {
+            TextButton(
+                onClick = { showInProgressFailuresDialog = true },
+                contentPadding = PaddingValues(0.dp),
+            ) {
+                Text(
+                    "View in-progress failures ($failedCount)",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
         if (currentDownloadUrl.isNotBlank()) {
             Text(
                 currentDownloadUrl,
@@ -471,6 +561,47 @@ private fun MirrorInfoSection(
             },
             confirmButton = {
                 TextButton(onClick = { showFailuresDialog = false }) {
+                    Text("Close")
+                }
+            },
+        )
+    }
+
+    if (showInProgressFailuresDialog) {
+        AlertDialog(
+            onDismissRequest = { showInProgressFailuresDialog = false },
+            title = { Text("Failures in Progress ($failedCount)") },
+            text = {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 350.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    items(inProgressFailures.toList()) { (url, error) ->
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp),
+                        ) {
+                            Text(
+                                text = url,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = error,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                        HorizontalDivider()
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showInProgressFailuresDialog = false }) {
                     Text("Close")
                 }
             },

@@ -24,7 +24,10 @@ data class CacheEntry(
 data class MirrorProgress(
     val downloadedCount: Int,
     val unchangedCount: Int,
+    val failedCount: Int,
     val currentUrl: String,
+    val recentFailure: Pair<String, String>? = null,
+    val failedUrls: Map<String, String> = emptyMap(),
 )
 
 class MirrorEngine(
@@ -67,6 +70,9 @@ class MirrorEngine(
     val failedUrls: Map<String, String>
         get() = failures.toMap()
 
+    var entryPath: String = "index.html"
+        private set
+
     /**
      * Mirrors or refreshes a website starting from the given [startUrl].
      * @param startUrl The initial URL to download.
@@ -76,8 +82,21 @@ class MirrorEngine(
     suspend fun mirror(startUrl: String, maxDepth: Int = 2): Boolean = withContext(Dispatchers.IO) {
         val httpUrl = startUrl.toHttpUrlOrNull()
         if (httpUrl == null) {
-            Log.e(tag, "Invalid start URL: $startUrl")
-            failures[startUrl] = "Invalid start URL"
+            val error = "Invalid start URL: $startUrl"
+            Log.e(tag, error)
+            downloadMutex.withLock {
+                failures[startUrl] = error
+                onProgress(
+                    MirrorProgress(
+                        downloadedCount = downloadedCount,
+                        unchangedCount = unchangedCount,
+                        failedCount = failures.size,
+                        currentUrl = startUrl,
+                        recentFailure = startUrl to error,
+                        failedUrls = failures.toMap(),
+                    )
+                )
+            }
             return@withContext false
         }
         val host = httpUrl.host
@@ -109,26 +128,52 @@ class MirrorEngine(
                 is FetchResult.Failure -> {
                     downloadMutex.withLock {
                         failures[normalizedUrl] = response.error
+                        onProgress(
+                            MirrorProgress(
+                                downloadedCount = downloadedCount,
+                                unchangedCount = unchangedCount,
+                                failedCount = failures.size,
+                                currentUrl = normalizedUrl,
+                                recentFailure = normalizedUrl to response.error,
+                                failedUrls = failures.toMap(),
+                            )
+                        )
                     }
                     return
                 }
 
                 is FetchResult.NotModified -> {
                     val contentType = response.contentType ?: cachedEntry?.contentType ?: ""
+                    val effectiveUrl = response.finalUrl
+                    val effectiveNormalizedUrl = normalizeUrl(effectiveUrl)
+                    val effectiveLocalFile = getLocalFile(effectiveNormalizedUrl, host)
+
                     downloadMutex.withLock {
                         unchangedCount++
-                        onProgress(MirrorProgress(downloadedCount, unchangedCount, normalizedUrl))
+                        if (depth == 0) {
+                            entryPath = computeEntryPath(effectiveLocalFile)
+                        }
+                        onProgress(
+                            MirrorProgress(
+                                downloadedCount = downloadedCount,
+                                unchangedCount = unchangedCount,
+                                failedCount = failures.size,
+                                currentUrl = effectiveNormalizedUrl,
+                                failedUrls = failures.toMap(),
+                            )
+                        )
                     }
 
-                    if (contentType.contains("text/html") && localFile.exists()) {
-                        val doc = Jsoup.parse(localFile.readText(), normalizedUrl)
-                        val nextUrls = remapAndCollect(doc, normalizedUrl, host)
+                    if (contentType.contains("text/html") && effectiveLocalFile.exists()) {
+                        val doc = Jsoup.parse(effectiveLocalFile.readText(), effectiveNormalizedUrl)
+                        val nextUrls = remapAndCollect(doc, effectiveNormalizedUrl, host)
                         nextUrls.forEach { nextUrl ->
                             downloadRecursive(nextUrl, host, depth + 1, maxDepth)
                         }
-                    } else if (contentType.contains("text/css") && localFile.exists()) {
-                        val css = localFile.readText()
-                        val nextUrls = collectFromCss(css, normalizedUrl)
+                    } else if (contentType.contains("text/css") && effectiveLocalFile.exists()) {
+                        val css = effectiveLocalFile.readText()
+                        val (remappedCss, nextUrls) = remapAndCollectCss(css, effectiveNormalizedUrl, host)
+                        effectiveLocalFile.writeText(remappedCss)
                         nextUrls.forEach { nextUrl ->
                             downloadRecursive(nextUrl, host, depth + 1, maxDepth)
                         }
@@ -138,11 +183,20 @@ class MirrorEngine(
                 is FetchResult.Success -> {
                     val contentType = response.contentType ?: ""
                     val bodyBytes = response.bytes
+                    val effectiveUrl = response.finalUrl
+                    val effectiveNormalizedUrl = normalizeUrl(effectiveUrl)
+                    val effectiveLocalFile = getLocalFile(effectiveNormalizedUrl, host)
 
-                    localFile.parentFile?.mkdirs()
+                    effectiveLocalFile.parentFile?.mkdirs()
 
                     downloadMutex.withLock {
-                        cacheMap[normalizedUrl] = CacheEntry(
+                        if (effectiveNormalizedUrl != normalizedUrl) {
+                            visitedUrls.add(effectiveNormalizedUrl)
+                        }
+                        if (depth == 0) {
+                            entryPath = computeEntryPath(effectiveLocalFile)
+                        }
+                        cacheMap[effectiveNormalizedUrl] = CacheEntry(
                             etag = response.etag,
                             lastModified = response.lastModified,
                             contentType = contentType,
@@ -151,47 +205,107 @@ class MirrorEngine(
 
                     if (contentType.contains("text/html")) {
                         val html = String(bodyBytes)
-                        val doc = Jsoup.parse(html, normalizedUrl)
+                        val doc = Jsoup.parse(html, effectiveNormalizedUrl)
                         
                         // Remap links and gather new URLs to download
-                        val nextUrls = remapAndCollect(doc, normalizedUrl, host)
+                        val nextUrls = remapAndCollect(doc, effectiveNormalizedUrl, host)
                         
                         // Write remapped HTML
-                        localFile.writeText(doc.outerHtml())
+                        effectiveLocalFile.writeText(doc.outerHtml())
+
+                        // If the URL was redirected (e.g. /docs -> /docs/index.html),
+                        // also write a redirect helper at the alias location so links to /docs work
+                        if (effectiveLocalFile.canonicalPath != localFile.canonicalPath) {
+                            try {
+                                localFile.parentFile?.mkdirs()
+                                val relToTarget = getRelativePath(localFile, effectiveLocalFile)
+                                localFile.writeText("<!DOCTYPE html><html><head><meta http-equiv=\"refresh\" content=\"0;url=$relToTarget\"></head><body></body></html>")
+                            } catch (_: Exception) {
+                                // Ignore alias write failure
+                            }
+                        }
                         
                         downloadMutex.withLock {
                             downloadedCount++
-                            onProgress(MirrorProgress(downloadedCount, unchangedCount, normalizedUrl))
+                            onProgress(
+                                MirrorProgress(
+                                    downloadedCount = downloadedCount,
+                                    unchangedCount = unchangedCount,
+                                    failedCount = failures.size,
+                                    currentUrl = effectiveNormalizedUrl,
+                                    failedUrls = failures.toMap(),
+                                )
+                            )
                         }
 
                         // Recursively download next URLs
                         nextUrls.forEach { nextUrl ->
                             downloadRecursive(nextUrl, host, depth + 1, maxDepth)
                         }
+                    } else if (contentType.contains("text/css")) {
+                        val css = String(bodyBytes)
+                        val (remappedCss, nextUrls) = remapAndCollectCss(css, effectiveNormalizedUrl, host)
+                        effectiveLocalFile.writeText(remappedCss)
+
+                        downloadMutex.withLock {
+                            downloadedCount++
+                            onProgress(
+                                MirrorProgress(
+                                    downloadedCount = downloadedCount,
+                                    unchangedCount = unchangedCount,
+                                    failedCount = failures.size,
+                                    currentUrl = effectiveNormalizedUrl,
+                                    failedUrls = failures.toMap(),
+                                )
+                            )
+                        }
+
+                        nextUrls.forEach { nextUrl ->
+                            downloadRecursive(nextUrl, host, depth + 1, maxDepth)
+                        }
                     } else {
-                        // For images, CSS, etc.
-                        localFile.writeBytes(bodyBytes)
+                        // For images, fonts, binaries, etc.
+                        effectiveLocalFile.writeBytes(bodyBytes)
                         
                         downloadMutex.withLock {
                             downloadedCount++
-                            onProgress(MirrorProgress(downloadedCount, unchangedCount, normalizedUrl))
-                        }
-
-                        if (contentType.contains("text/css")) {
-                            val css = String(bodyBytes)
-                            val nextUrls = collectFromCss(css, normalizedUrl)
-                            nextUrls.forEach { nextUrl ->
-                                downloadRecursive(nextUrl, host, depth + 1, maxDepth)
-                            }
+                            onProgress(
+                                MirrorProgress(
+                                    downloadedCount = downloadedCount,
+                                    unchangedCount = unchangedCount,
+                                    failedCount = failures.size,
+                                    currentUrl = effectiveNormalizedUrl,
+                                    failedUrls = failures.toMap(),
+                                )
+                            )
                         }
                     }
                 }
             }
         } catch (e: Exception) {
             Log.e(tag, "Failed to download $url: ${e.message}")
+            val errorMsg = e.message ?: "Unknown error"
             downloadMutex.withLock {
-                failures[normalizedUrl] = e.message ?: "Unknown error"
+                failures[normalizedUrl] = errorMsg
+                onProgress(
+                    MirrorProgress(
+                        downloadedCount = downloadedCount,
+                        unchangedCount = unchangedCount,
+                        failedCount = failures.size,
+                        currentUrl = normalizedUrl,
+                        recentFailure = normalizedUrl to errorMsg,
+                        failedUrls = failures.toMap(),
+                    )
+                )
             }
+        }
+    }
+
+    private fun computeEntryPath(file: File): String {
+        return try {
+            file.canonicalFile.relativeTo(rootDir.canonicalFile).path.replace('\\', '/')
+        } catch (_: Exception) {
+            file.absolutePath.removePrefix(rootDir.absolutePath).removePrefix(File.separator).replace('\\', '/')
         }
     }
 
@@ -199,21 +313,29 @@ class MirrorEngine(
         return url.toHttpUrlOrNull()?.newBuilder()?.fragment(null)?.build()?.toString() ?: url
     }
 
-    private fun collectFromCss(css: String, cssUrl: String): List<String> {
+    private fun remapAndCollectCss(css: String, cssUrl: String, host: String): Pair<String, List<String>> {
         val nextUrls = mutableListOf<String>()
-        val regex = Regex("""url\(['"]?([^'")]+)['"]?\)""", RegexOption.IGNORE_CASE)
-        val baseHttpUrl = cssUrl.toHttpUrlOrNull() ?: return emptyList()
+        val currentFile = getLocalFile(cssUrl, host)
+        val baseHttpUrl = cssUrl.toHttpUrlOrNull() ?: return css to emptyList()
+        val regex = Regex("""url\(\s*['"]?([^'")]+?)['"]?\s*\)""", RegexOption.IGNORE_CASE)
 
-        regex.findAll(css).forEach { match ->
-            val relUrl = match.groupValues[1].trim()
-            if (!relUrl.startsWith("data:")) {
-                val absUrl = baseHttpUrl.resolve(relUrl)?.toString()
+        val remappedCss = regex.replace(css) { match ->
+            val rawUrl = match.groupValues[1].trim()
+            if (rawUrl.startsWith("data:") || rawUrl.startsWith("#")) {
+                match.value
+            } else {
+                val absUrl = baseHttpUrl.resolve(rawUrl)?.toString()
                 if (absUrl != null) {
                     nextUrls.add(absUrl)
+                    val targetFile = getLocalFile(absUrl, host)
+                    val relativePath = getRelativePath(currentFile, targetFile)
+                    "url(\"$relativePath\")"
+                } else {
+                    match.value
                 }
             }
         }
-        return nextUrls
+        return remappedCss to nextUrls
     }
 
     private suspend fun fetchUrl(
@@ -229,8 +351,12 @@ class MirrorEngine(
 
         try {
             client.newCall(requestBuilder.build()).execute().use { response ->
+                val finalUrl = response.request.url.toString()
                 if (response.code == 304) {
-                    return@withContext FetchResult.NotModified(response.header("Content-Type"))
+                    return@withContext FetchResult.NotModified(
+                        contentType = response.header("Content-Type"),
+                        finalUrl = finalUrl,
+                    )
                 }
                 if (!response.isSuccessful) {
                     return@withContext FetchResult.Failure("HTTP ${response.code}: ${response.message}")
@@ -241,6 +367,7 @@ class MirrorEngine(
                     contentType = response.header("Content-Type"),
                     etag = response.header("ETag"),
                     lastModified = response.header("Last-Modified"),
+                    finalUrl = finalUrl,
                 )
             }
         } catch (e: Exception) {
@@ -248,16 +375,16 @@ class MirrorEngine(
         }
     }
 
-    private fun getLocalFile(urlStr: String, startHost: String = ""): File {
+    fun getLocalFile(urlStr: String, startHost: String = ""): File {
         val httpUrl = urlStr.toHttpUrlOrNull() ?: return File(rootDir, "error.html")
-        val pathSegments = httpUrl.pathSegments
+        val pathSegments = httpUrl.pathSegments.filter { it.isNotEmpty() }
         
         var path = pathSegments.joinToString("/")
-        if ((path.isEmpty()) || path == "/") {
+        if (path.isEmpty()) {
             path = "index.html"
         } else if (httpUrl.encodedPath.endsWith("/")) {
-            path = if (path.isEmpty()) "index.html" else "$path/index.html"
-        } else if (!path.contains(".")) {
+            path = "$path/index.html"
+        } else if (!path.substringAfterLast("/").contains(".")) {
             path += ".html"
         }
 
@@ -273,9 +400,18 @@ class MirrorEngine(
         val nextUrls = mutableListOf<String>()
         val currentFile = getLocalFile(currentUrl, host)
 
+        // Remove any <base> tags so local relative paths work properly in offline viewer
+        doc.select("base").remove()
+
         // Helper to handle elements: remapUrls(selector, attr, isNavigationLink)
         fun remap(selector: String, attr: String, isNavigationLink: Boolean) {
             doc.select(selector).forEach { element ->
+                val rawVal = element.attr(attr).trim()
+                // Pure page-internal anchors like href="#section" should remain unchanged
+                if (isNavigationLink && rawVal.startsWith("#")) {
+                    return@forEach
+                }
+
                 val absUrl = element.attr("abs:$attr")
                 val targetHttpUrl = absUrl.toHttpUrlOrNull() ?: return@forEach
 
@@ -284,7 +420,13 @@ class MirrorEngine(
                     if (targetHttpUrl.host == host) {
                         val targetFile = getLocalFile(absUrl, host)
                         val relativePath = getRelativePath(currentFile, targetFile)
-                        element.attr(attr, relativePath)
+                        val fragment = targetHttpUrl.fragment
+                        val finalRemapped = when {
+                            fragment != null && targetFile.canonicalPath == currentFile.canonicalPath -> "#$fragment"
+                            fragment != null -> "$relativePath#$fragment"
+                            else -> relativePath
+                        }
+                        element.attr(attr, finalRemapped)
                         nextUrls.add(absUrl)
                     }
                 } else {
@@ -301,18 +443,29 @@ class MirrorEngine(
         remap("img[src]", "src", isNavigationLink = false)
         remap("link[href]", "href", isNavigationLink = false)
         remap("script[src]", "src", isNavigationLink = false)
+        remap("source[src]", "src", isNavigationLink = false)
+        remap("video[src]", "src", isNavigationLink = false)
+        remap("audio[src]", "src", isNavigationLink = false)
+        remap("iframe[src]", "src", isNavigationLink = false)
 
         return nextUrls
     }
 
     private fun getRelativePath(fromFile: File, toFile: File): String {
-        val fromPath = fromFile.parentFile?.toPath()?.toAbsolutePath() ?: rootDir.toPath().toAbsolutePath()
-        val toPath = toFile.toPath().toAbsolutePath()
-        
+        val fromDir = (fromFile.parentFile ?: rootDir).canonicalFile
+        val target = toFile.canonicalFile
+        val root = rootDir.canonicalFile
+
         return try {
-            fromPath.relativize(toPath).toString().replace("\\", "/")
+            fromDir.toPath().relativize(target.toPath()).toString().replace('\\', '/')
         } catch (_: Exception) {
-            toFile.absolutePath.removePrefix(rootDir.absolutePath).removePrefix(File.separator).replace("\\", "/")
+            try {
+                val fromToRoot = fromDir.toPath().relativize(root.toPath())
+                val rootToTarget = root.toPath().relativize(target.toPath())
+                fromToRoot.resolve(rootToTarget).normalize().toString().replace('\\', '/')
+            } catch (_: Exception) {
+                target.absolutePath.removePrefix(root.absolutePath).removePrefix(File.separator).replace('\\', '/')
+            }
         }
     }
 
@@ -322,8 +475,9 @@ class MirrorEngine(
             val contentType: String?,
             val etag: String?,
             val lastModified: String?,
+            val finalUrl: String,
         ) : FetchResult
-        class NotModified(val contentType: String?) : FetchResult
+        class NotModified(val contentType: String?, val finalUrl: String) : FetchResult
         class Failure(val error: String) : FetchResult
     }
 }

@@ -29,19 +29,35 @@ fun ViewerScreen(
     val context = LocalContext.current
     val mirrorsDir = File(context.filesDir, "mirrors")
     val targetDir = File(mirrorsDir, mirrorId)
-    val indexFile = File(targetDir, "index.html")
-
-    val displayTitle = remember(targetDir) {
+    val metadata = remember(targetDir) {
         val metadataFile = File(targetDir, "metadata.json")
         if (metadataFile.exists()) {
             try {
-                JSONObject(metadataFile.readText()).optString("url").takeIf { it.isNotBlank() }
+                JSONObject(metadataFile.readText())
             } catch (_: Exception) {
                 null
             }
         } else {
             null
-        } ?: mirrorId.replace("___", "://").replace("_", "/")
+        }
+    }
+
+    val displayTitle = remember(metadata, mirrorId) {
+        metadata?.optString("url")?.takeIf { it.isNotBlank() }
+            ?: mirrorId.replace("___", "://").replace("_", "/")
+    }
+
+    val entryFile = remember(metadata, targetDir) {
+        val entryPath = metadata?.optString("entryPath")?.takeIf { it.isNotBlank() }
+        val resolved = if (!entryPath.isNullOrBlank()) File(targetDir, entryPath) else null
+        if ((resolved != null) && resolved.exists()) {
+            resolved
+        } else if (File(targetDir, "index.html").exists()) {
+            File(targetDir, "index.html")
+        } else {
+            targetDir.walkTopDown().firstOrNull { it.isFile && it.extension.equals("html", ignoreCase = true) }
+                ?: (resolved ?: File(targetDir, "index.html"))
+        }
     }
 
     Scaffold(
@@ -56,16 +72,16 @@ fun ViewerScreen(
             )
         }
     ) { innerPadding ->
-        if (indexFile.exists()) {
+        if (entryFile.exists()) {
             WebViewComponent(
-                file = indexFile,
+                file = entryFile,
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(innerPadding)
             )
         } else {
             Text(
-                "Mirror not found or index.html missing at ${indexFile.absolutePath}",
+                "Mirror not found or HTML entry page missing at ${entryFile.absolutePath}",
                 modifier = Modifier.padding(innerPadding)
             )
         }
