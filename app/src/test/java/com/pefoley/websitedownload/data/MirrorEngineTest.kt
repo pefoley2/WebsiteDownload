@@ -3,8 +3,10 @@ package com.pefoley.websitedownload.data
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import okhttp3.OkHttpClient
+import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.RecordedRequest
 import org.junit.After
 import org.junit.Assert
 import org.junit.Assert.assertTrue
@@ -266,26 +268,31 @@ class MirrorEngineTest {
             progressList.add(progress)
         }
 
-        server.enqueue(
-            MockResponse()
-                .setBody("""
-                    <html>
-                        <body>
-                            <a href="page2.html">Page 2</a>
-                            <img src="missing.png">
-                        </body>
-                    </html>
-                """.trimIndent())
-                .setHeader("Content-Type", "text/html")
-        )
-        // page2.html succeeds
-        server.enqueue(
-            MockResponse()
-                .setBody("<html><body>Page 2</body></html>")
-                .setHeader("Content-Type", "text/html")
-        )
-        // missing.png fails with 404
-        server.enqueue(MockResponse().setResponseCode(404))
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                return when (request.path) {
+                    "/" -> MockResponse()
+                        .setBody(
+                            """
+                            <html>
+                                <body>
+                                    <a href="page2.html">Page 2</a>
+                                    <img src="missing.png">
+                                </body>
+                            </html>
+                        """.trimIndent()
+                        )
+                        .setHeader("Content-Type", "text/html")
+
+                    "/page2.html" -> MockResponse()
+                        .setBody("<html><body>Page 2</body></html>")
+                        .setHeader("Content-Type", "text/html")
+
+                    "/missing.png" -> MockResponse().setResponseCode(404)
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+        }
 
         val success = engineWithProgress.mirror(baseUrl, maxDepth = 1)
         assertTrue(success)
@@ -448,7 +455,7 @@ class MirrorEngineTest {
     }
 
     @Test
-    fun `test refresh with external resource preserves original url`() = runBlocking<Unit> {
+    fun `test refresh with external resource preserves original url`() = runBlocking {
         withTimeout(10000.milliseconds) {
             val externalServer = MockWebServer()
             externalServer.start()
